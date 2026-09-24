@@ -1,15 +1,17 @@
 // SPDX-FileCopyrightText: 2026 ExoPro. Inspired by @jasonish/pi-prompt-history
 // SPDX-License-Identifier: MIT
 
-// Consolidated multi-concurrency store (v2), slice 1: project paths and
-// identity, the advisory registry, entry primitives, and the per-instance
-// session writer. Scope drains/deletes, legacy migration and seed
-// bootstrap, and GC/compaction arrive in later slices.
+// Consolidated multi-concurrency store (v2), slices 1+2: project paths and
+// identity, the advisory registry, entry primitives, the per-instance
+// session writer, and the scope drain/reader/query section (ordering,
+// dedup, tombstone filter, project/global drains). Legacy migration and
+// seed bootstrap, scope deletes, and GC/compaction arrive in later slices.
 // Formerly store-paths.ts + registry.ts + multi-store.ts (+ v1 primitives).
 
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { readHiddenPrompts } from "./hide-prompts.ts";
 
 // ===========================================================================
 // Paths (formerly store-paths.ts)
@@ -184,8 +186,8 @@ export function parseStoreLine(raw: string): StoreEntry | null {
 }
 
 // ===========================================================================
-// Instance writer (formerly multi-store.ts; scope drains/deletes and GC
-// arrive in later slices)
+// Instance writer (formerly multi-store.ts; scope deletes and GC arrive
+// in later slices)
 // ===========================================================================
 
 /** Mutable state of ONE pi instance's exclusive capture file. */
@@ -242,4 +244,193 @@ export function appendSessionCapture(
   fs.mkdirSync(path.dirname(state.filePath), { recursive: true });
   fs.appendFileSync(state.filePath, serializeEntry(entry) + "\n", "utf8");
   state.lineCount += 1;
+}
+
+
+// ---------------------------------------------------------------------------
+// Multi-file reader (design v2: k-way backward merge)
+// ---------------------------------------------------------------------------
+
+/** UI-level prompt identity: whitespace-collapsed, case-insensitive. */
+function promptKey(text: string): string {
+  return text.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function fileMtimeMs(file: string): number {
+  try {
+    return fs.statSync(file).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function listProjectFiles(dir: string): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((e) => e.isFile() && e.name.endsWith(".jsonl"))
+    .map((e) => path.join(dir, e.name))
+    .sort((a, b) => fileMtimeMs(b) - fileMtimeMs(a));
+}
+
+/** Read one file's valid entries (chronological). */
+function readFileEntries(file: string): StoreEntry[] {
+  let raw = "";
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  const entries: StoreEntry[] = [];
+  for (const lineText of raw.split("\n")) {
+    const parsed = parseStoreLine(lineText);
+    if (parsed) entries.push(parsed);
+  }
+  return entries;
+}
+
+/**
+ * Sort key = the newest entry ts in the file (fallback: file mtime).
+ * ts-based keys are STABLE under atomic rewrites (deletes/compaction
+ * bump mtime, which used to reshuffle the drain order).
+ */
+function fileSortKey(file: string, entries: StoreEntry[]): number {
+  let maxTs = 0;
+  for (const entry of entries) {
+    if (entry.ts !== undefined && entry.ts > maxTs) maxTs = entry.ts;
+  }
+  return maxTs > 0 ? maxTs : fileMtimeMs(file);
+}
+
+/** Tombstone key - byte-compatible with hide-prompts' promptDedupKey. */
+function promptDedupKeyOf(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, 120).toLowerCase();
+}
+
+/**
+ * Sequential backward drain over PRE-SORTED files: each file fully,
+ * newest-line-first, deduped by UI-level identity, capped at `limit`.
+ */
+function drainFiles(
+  files: string[],
+  limit: number,
+  hidden: Set<string> = new Set(),
+): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const file of files) {
+    const entries = readFileEntries(file);
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const key = promptKey(entries[i].text);
+      if (seen.has(key)) continue;
+      if (hidden.size > 0 && hidden.has(promptDedupKeyOf(entries[i].text))) {
+        continue;
+      }
+      seen.add(key);
+      out.push(entries[i].text);
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
+
+/** Sort files for draining: ts-keyed, newest first, empty files dropped. */
+function sortFilesForDrain(files: string[]): string[] {
+  return files
+    .map((file) => ({ file, entries: readFileEntries(file) }))
+    .filter((f) => f.entries.length > 0)
+    .sort(
+      (a, b) =>
+        fileSortKey(b.file, b.entries) - fileSortKey(a.file, a.entries),
+    )
+    .map((f) => f.file);
+}
+
+/**
+ * Result of a scope drain: `ok` with the drained prompts, or `blocked`
+ * when the tombstone file is untrusted (fail-closed READ half). The
+ * blocked shape carries NO prompts field, so a caller cannot accidentally
+ * render prompts that may include hidden ones.
+ */
+export type DrainResult =
+  | { status: "ok"; prompts: string[] }
+  | { status: "blocked"; message: string };
+
+/**
+ * Shared drain tail: without a `stateDir` the raw drain semantics hold (no
+ * filter). With one, the tombstone filter applies and fails CLOSED: an
+ * untrusted hidden.json (unreadable, corrupt, wrong shape) blocks the
+ * whole drain with the recovery message instead of resurfacing hidden
+ * prompts; a missing file is the safe empty tombstone set and drains
+ * normally.
+ */
+function drainWithHidden(
+  files: string[],
+  limit: number,
+  stateDir?: string,
+): DrainResult {
+  if (!stateDir) return { status: "ok", prompts: drainFiles(files, limit) };
+  const read = readHiddenPrompts(stateDir);
+  if (read.status === "untrusted") {
+    return { status: "blocked", message: read.message };
+  }
+  return { status: "ok", prompts: drainFiles(files, limit, read.keys) };
+}
+
+/**
+ * Drain the PROJECT scope: all .jsonl files in the project dir (seed.jsonl
+ * included), mtime-newest-first, deduped, capped at `limit` (default 1000).
+ * With a `stateDir`, the tombstone filter applies and fails closed: an
+ * untrusted hidden.json blocks the drain (see DrainResult).
+ */
+export function drainProject(
+  root: string,
+  cwd: string,
+  limit: number = 1000,
+  stateDir?: string,
+): DrainResult {
+  return drainWithHidden(
+    sortFilesForDrain(listProjectFiles(path.join(root, "projects", projectHash(cwd)))),
+    limit,
+    stateDir,
+  );
+}
+
+/**
+ * Drain the GLOBAL scope: every project dir's files, mtime-newest-first,
+ * deduped, capped — with the legacy global seed appended LAST (deliberate:
+ * it is the least specific, migrated source, so per-project entries win
+ * recency and keep-first dedup favors them). With a `stateDir`, the
+ * tombstone filter applies and fails closed: an untrusted hidden.json
+ * blocks the drain (see DrainResult).
+ */
+export function drainGlobal(
+  root: string,
+  limit: number = 1000,
+  stateDir?: string,
+): DrainResult {
+  const files: string[] = [];
+  const globalSeed = globalSeedPath(root);
+
+  let projectDirs: fs.Dirent[];
+  try {
+    projectDirs = fs.readdirSync(path.join(root, "projects"), {
+      withFileTypes: true,
+    });
+  } catch {
+    projectDirs = [];
+  }
+  for (const dirEntry of projectDirs) {
+    if (!dirEntry.isDirectory()) continue;
+    files.push(
+      ...listProjectFiles(path.join(root, "projects", dirEntry.name)),
+    );
+  }
+  const sorted = sortFilesForDrain(files);
+  if (fs.existsSync(globalSeed)) sorted.push(globalSeed); // legacy last
+  return drainWithHidden(sorted, limit, stateDir);
 }
