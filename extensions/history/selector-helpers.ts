@@ -25,11 +25,13 @@ export interface PromptEntry {
   ts?: number;
 }
 
+/** Half-open window of list rows currently rendered (spec: centered cursor). */
 export interface VisibleRange {
   start: number;
   end: number;
 }
 
+/** One rendered list row: the record, its master index, and cursor state. */
 export interface VisiblePromptRecord {
   index: number;
   record: PromptRecord;
@@ -77,41 +79,6 @@ export function clampPreviewOffset(
   return Math.max(0, Math.min(offset, Math.max(0, totalLines - viewportRows)));
 }
 
-export function computeVisibleRange(
-  selectedIndex: number,
-  total: number,
-  maxVisible: number,
-): VisibleRange {
-  if (total <= 0 || maxVisible <= 0) return { start: 0, end: 0 };
-  if (total <= maxVisible) return { start: 0, end: total };
-
-  const half = Math.floor(maxVisible / 2);
-  const start = Math.max(0, Math.min(selectedIndex - half, total - maxVisible));
-
-  return {
-    start,
-    end: Math.min(start + maxVisible, total),
-  };
-}
-
-export function moveSelectedIndex(
-  selectedIndex: number,
-  total: number,
-  delta: number,
-): number {
-  if (total === 0) return 0;
-  return (selectedIndex + delta + total) % total;
-}
-
-export function pageSelectedIndex(
-  selectedIndex: number,
-  total: number,
-  pageSize: number,
-): number {
-  if (total === 0) return 0;
-  return clampSelectedIndex(selectedIndex + pageSize, total);
-}
-
 /**
  * Normalization key for read-time dedup (spec C3): byte-matches the
  * APPLIED patch key in nav/patches/editor.cjs (:480-:586) — whitespace
@@ -152,6 +119,73 @@ export function dedupePromptEntries<T extends string | PromptEntry>(
   }
   return deduped;
 }
+
+// ---------------------------------------------------------------------------
+// Selector navigation & windowing (open-flow surface; search/paging helpers
+// join in later stages)
+// ---------------------------------------------------------------------------
+
+/** Wrapped cursor move: (+/-delta) with modulo wrap over the total. */
+export function moveSelectedIndex(
+  selectedIndex: number,
+  total: number,
+  delta: number,
+): number {
+  if (total === 0) return 0;
+  return (selectedIndex + delta + total) % total;
+}
+
+export function pageSelectedIndex(
+  selectedIndex: number,
+  total: number,
+  pageSize: number,
+): number {
+  if (total === 0) return 0;
+  return clampSelectedIndex(selectedIndex + pageSize, total);
+}
+
+/**
+ * Centered visible window (a22588fc shape): keep the cursor near the middle
+ * once the list outgrows maxVisible; small lists render in full.
+ */
+export function computeVisibleRange(
+  selectedIndex: number,
+  total: number,
+  maxVisible: number,
+): VisibleRange {
+  if (total <= 0 || maxVisible <= 0) return { start: 0, end: 0 };
+  if (total <= maxVisible) return { start: 0, end: total };
+
+  const half = Math.floor(maxVisible / 2);
+  const start = Math.max(0, Math.min(selectedIndex - half, total - maxVisible));
+
+  return {
+    start,
+    end: Math.min(start + maxVisible, total),
+  };
+}
+
+/** The rows to render for the current cursor: sliced, indexed, cursor-flagged. */
+export function getVisiblePromptRecords(
+  records: PromptRecord[],
+  selectedIndex: number,
+  maxVisible: number,
+): VisiblePromptRecord[] {
+  const { start, end } = computeVisibleRange(
+    selectedIndex,
+    records.length,
+    maxVisible,
+  );
+  return records.slice(start, end).map((record, offset) => ({
+    index: start + offset,
+    record,
+    isSelected: start + offset === selectedIndex,
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Lazy windowing (spec C1/C2, design §D3/§D4) and search visibility
+// ---------------------------------------------------------------------------
 
 /**
  * First-paint window size (spec C1, AC-L1-1): min(initialBatch, total),
@@ -215,35 +249,6 @@ export function loadedCountForTarget(
   return next;
 }
 
-export function getVisiblePromptRecords(
-  records: PromptRecord[],
-  selectedIndex: number,
-  maxVisible: number,
-): VisiblePromptRecord[] {
-  const { start, end } = computeVisibleRange(
-    selectedIndex,
-    records.length,
-    maxVisible,
-  );
-  return records.slice(start, end).map((record, offset) => ({
-    index: start + offset,
-    record,
-    isSelected: start + offset === selectedIndex,
-  }));
-}
-
-export async function withExpandedHistoryGlobals<T>(
-  globals: PiHistoryGlobals,
-  run: () => Promise<T>,
-): Promise<T> {
-  globals.__piHistoryExpand?.();
-  try {
-    return await run();
-  } finally {
-    globals.__piHistoryTrim?.();
-  }
-}
-
 /**
  * Full-snapshot visibility for non-empty queries (AC-L2-3r, user-directed
  * 2026-09-08): searching must see the whole deduped snapshot, not just the
@@ -274,4 +279,16 @@ export function filterPrompts(
   });
 
   return filtered.slice(0, MAX_RESULTS);
+}
+
+export async function withExpandedHistoryGlobals<T>(
+  globals: PiHistoryGlobals,
+  run: () => Promise<T>,
+): Promise<T> {
+  globals.__piHistoryExpand?.();
+  try {
+    return await run();
+  } finally {
+    globals.__piHistoryTrim?.();
+  }
 }
