@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type SpawnOptions } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import fsSync from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { daemonFor } from "../lib/codegraph-daemon.ts";
+import { clearCodegraphResolveCache } from "../lib/codegraph-cli-resolve.ts";
 import { lockPathFor, readLeaseVerdict } from "../lib/codegraph-lease.ts";
 import {
 	buildWindowsCommand,
@@ -20,6 +23,7 @@ import {
 	skipsSession,
 	spawnCodegraph,
 	SYNC_RETRY_DELAY_MS,
+	SYNC_TIMEOUT_MS,
 	syncBeforeSearch,
 	warmUpDaemon,
 	type ReadinessInput,
@@ -158,6 +162,17 @@ test("planIndexAction: present syncs, unknown does nothing, markers decide init"
 	writeFileSync(join(fresh, "package.json"), "{}\n");
 	assert.equal(planIndexAction(fresh, "absent", () => true), "init");
 	assert.equal(planIndexAction(dir(t, "plan-bare"), "absent", () => true), "none", "no marker file");
+});
+
+test("planIndexAction: a symlinked .codegraph directory is never synced automatically", (t) => {
+	const real = dir(t, "plan-symlink-real");
+	writeDb(real);
+	const linked = dir(t, "plan-symlink-linked");
+	symlinkSync(join(real, ".codegraph"), join(linked, ".codegraph"));
+	// indexState follows the link to "present"; the plan must not turn that into a sync: CodeGraph
+	// would follow the link too and write this workspace's files into the linked checkout's index.
+	assert.equal(planIndexAction(linked, "present", () => true), "none", "the same unsafe directory the explicit tool refuses is never auto-synced");
+	assert.equal(planIndexAction(real, "present", () => false), "sync", "a regular .codegraph directory keeps its sync");
 });
 
 test("skipsSession: a child or a reload never starts index work", () => {
@@ -484,17 +499,23 @@ test("warmUpDaemon: a valid call reply after the deadline keeps the warm-up fail
 	const pidFile = join(bin, "child.pid");
 	const initializeReply = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2024-11-05", capabilities: {} } });
 	const lateCallReply = JSON.stringify({ jsonrpc: "2.0", id: 2, result: { content: [{ text: "late" }] } });
-	// Handshake at once, then the deadline passes while the tools/call answer is still pending:
-	// a reply that lands only after the timeout — before the SIGKILL escalation ends the
-	// SIGTERM-ignoring child — must not turn the missed warm-up into a success.
+	// Handshake at once, then the child catches the timeout's group SIGTERM (the observed event
+	// that proves the deadline fired) and holds. Only after the test answers with the GO file —
+	// strictly after the deadline — does it deliver the valid call reply, then keep running
+	// until the SIGKILL escalation ends it: a delay-based script could never prove the ordering.
+	const sawTermFile = join(bin, "saw-term");
+	const goFile = join(bin, "go");
+	const repliedFile = join(bin, "replied");
 	const script = [
 		"#!/bin/sh",
-		"trap '' TERM",
 		"printf '%s\\n' \"$$\" > \"$FAKE_PIDFILE\"",
 		"printf '%s\\n' '" + initializeReply + "'",
-		"sleep 0.7",
+		"trap 'printf term > \"$FAKE_SAW_TERM\"' TERM",
+		"while [ ! -f \"$FAKE_SAW_TERM\" ]; do sleep 0.02; done",
+		"while [ ! -f \"$FAKE_GO\" ]; do sleep 0.02; done",
 		"printf '%s\\n' '" + lateCallReply + "'",
-		"sleep 30",
+		"printf replied > \"$FAKE_REPLIED\"",
+		"while :; do sleep 0.2; done",
 		"",
 	].join("\n");
 	writeFileSync(join(bin, "codegraph"), script);
@@ -502,9 +523,15 @@ test("warmUpDaemon: a valid call reply after the deadline keeps the warm-up fail
 	const previousPath = process.env.PATH;
 	process.env.PATH = `${bin}:${previousPath}`;
 	process.env.FAKE_PIDFILE = pidFile;
+	process.env.FAKE_SAW_TERM = sawTermFile;
+	process.env.FAKE_GO = goFile;
+	process.env.FAKE_REPLIED = repliedFile;
 	t.after(() => {
 		process.env.PATH = previousPath;
 		delete process.env.FAKE_PIDFILE;
+		delete process.env.FAKE_SAW_TERM;
+		delete process.env.FAKE_GO;
+		delete process.env.FAKE_REPLIED;
 		if (!existsSync(pidFile)) return;
 		try {
 			process.kill(Number(readFileSync(pidFile, "utf8").trim()), "SIGKILL");
@@ -512,8 +539,13 @@ test("warmUpDaemon: a valid call reply after the deadline keeps the warm-up fail
 			/* already gone */
 		}
 	});
-	const warmed = await warmUpDaemon(dir(t, "warm-late-reply"), false, 500);
-	assert.equal(warmed, false, "a call reply that lands after the deadline does not report a successful warm-up");
+	const warmed = warmUpDaemon(dir(t, "warm-late-reply"), false, 500);
+	const termDeadline = Date.now() + 3_000;
+	while (!existsSync(sawTermFile) && Date.now() < termDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.ok(existsSync(sawTermFile), "the observed event: the deadline fired and the child caught its group SIGTERM");
+	writeFileSync(goFile, "");
+	assert.equal(await warmed, false, "a call reply that lands after the deadline does not report a successful warm-up");
+	assert.equal(existsSync(repliedFile), true, "the late reply really was delivered after the deadline");
 	const fileDeadline = Date.now() + 3_000;
 	while (!existsSync(pidFile) && Date.now() < fileDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
 	assert.ok(existsSync(pidFile), "the fake daemon spawned");
@@ -574,6 +606,59 @@ test("runCodegraph: a timeout kills the command's whole process group, grandchil
 	assert.deepEqual(pids.map(alive), [false, false], "the direct child AND its grandchild die with the group kill");
 });
 
+test("runCodegraph: a timed-out group member that outlives the SIGTERM leader is killed before the result", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX fake-bin harness");
+	const bin = dir(t, "close-kill-bin");
+	const pidFile = join(bin, "child.pid");
+	const memberFile = join(bin, "member.pid");
+	// The leader obeys SIGTERM (exec sleep 30) and holds the pipes; the member ignores SIGTERM
+	// and holds no stdio, so the leader's close fires while the member still runs — the result
+	// must not resolve before that member is gone.
+	writeFileSync(join(bin, "codegraph"), [
+		"#!/bin/sh",
+		"( trap '' TERM; while :; do sleep 0.2; done ) >/dev/null 2>&1 &",
+		"printf '%s\\n' \"$!\" > \"$FAKE_MEMBER\"",
+		"printf '%s\\n' \"$$\" > \"$FAKE_PIDFILE\"",
+		"exec sleep 30",
+		"",
+	].join("\n"));
+	chmodSync(join(bin, "codegraph"), 0o755);
+	const previousPath = process.env.PATH;
+	process.env.PATH = `${bin}:${previousPath}`;
+	process.env.FAKE_PIDFILE = pidFile;
+	process.env.FAKE_MEMBER = memberFile;
+	t.after(() => {
+		process.env.PATH = previousPath;
+		delete process.env.FAKE_PIDFILE;
+		delete process.env.FAKE_MEMBER;
+		for (const file of [pidFile, memberFile]) {
+			if (!existsSync(file)) continue;
+			try {
+				process.kill(Number(readFileSync(file, "utf8").trim()), "SIGKILL");
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+	const ok = await runCodegraph(["sync", "-q"], dir(t, "close-kill-cwd"), 300);
+	assert.equal(ok, false, "the ignoring member still reports the timeout");
+	const fileDeadline = Date.now() + 3_000;
+	while ((!existsSync(pidFile) || !existsSync(memberFile)) && Date.now() < fileDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.ok(existsSync(pidFile) && existsSync(memberFile), "the fake command and its group member started");
+	const pids = [Number(readFileSync(pidFile, "utf8").trim()), Number(readFileSync(memberFile, "utf8").trim())];
+	const alive = (pid: number) => {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	const deadline = Date.now() + 3_000;
+	while (pids.some(alive) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.deepEqual(pids.map(alive), [false, false], "a group member holding no stdio cannot outlive the reported result");
+});
+
 test("buildWindowsCommand: a UNC project path keeps its backslashes and cmd metacharacters stay inert", () => {
 	const unc = "\\\\server\\share\\proj";
 	assert.equal(
@@ -603,6 +688,18 @@ test("buildWindowsCommand: a literal percent in an argument is rejected, not cmd
 
 test("runCodegraph: a percent-carrying project path is rejected before any spawn on Windows", async (t) => {
 	if (process.platform !== "win32") return t.skip("the cmd.exe percent expansion only exists on win32");
+	// A runner whose codegraph.cmd resolves would take the direct argument vector — the percent
+	// rides it literally, and the rejecting builder never runs. An empty PATH forces the
+	// unresolved shim, isolating the cmd.exe fallback's percent rejection; the resolved-vector
+	// transport has its own seam test above.
+	const emptyBin = dir(t, "pct-empty-bin");
+	const previousPath = process.env.PATH;
+	process.env.PATH = emptyBin;
+	clearCodegraphResolveCache();
+	t.after(() => {
+		process.env.PATH = previousPath;
+		clearCodegraphResolveCache();
+	});
 	const project = join(tmpdir(), `gentle-codegraph-readiness-pct-${process.pid}-%USERNAME%`);
 	mkdirSync(project, { recursive: true });
 	t.after(() => rmSync(project, { recursive: true, force: true }));
@@ -869,6 +966,63 @@ test("runCodegraphSeedSync: a staging copy whose tracked files cannot be listed 
 	assert.equal(existsSync(seenFile), false, "the sync itself never runs when the copy cannot be counted");
 });
 
+test("runCodegraphSeedSync: an informational empty-index listing is an empty path set, not a failure", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX fake-bin harness");
+	const bin = dir(t, "seed-empty-bin");
+	const seenFile = join(bin, "seen.log");
+	const listedFile = join(bin, "listed");
+	// The real CLI prints this exact informational sentence (exit 0, stdout) when `files` finds
+	// no indexed files instead of `[]` — the documented-by-source empty result. The
+	// before-listing sees it; the validating sync and the after-listing still run.
+	writeFileSync(join(bin, "codegraph"), [
+		"#!/bin/sh",
+		'case "$1" in',
+		"  files)",
+		'    if [ ! -f "$FAKE_LISTED" ]; then',
+		"      printf '%s\\n' 'ℹ No files indexed. Run \"codegraph index\" first.'",
+		'      touch "$FAKE_LISTED"',
+		"    else",
+		"      printf '[]\\n'",
+		"    fi",
+		"    ;;",
+		'  sync) printf seen >> "$FAKE_SEEN" ;;',
+		"esac",
+		"exit 0",
+	].join("\n"));
+	chmodSync(join(bin, "codegraph"), 0o755);
+	const previousPath = process.env.PATH;
+	process.env.PATH = `${bin}:${previousPath}`;
+	process.env.FAKE_SEEN = seenFile;
+	process.env.FAKE_LISTED = listedFile;
+	t.after(() => {
+		process.env.PATH = previousPath;
+		delete process.env.FAKE_SEEN;
+		delete process.env.FAKE_LISTED;
+	});
+	const worktree = dir(t, "seed-empty-wt");
+	mkdirSync(join(worktree, "src"), { recursive: true });
+	writeFileSync(join(worktree, "src", "a.ts"), "export const a = 1;\n");
+	const staging = join(worktree, ".codegraph", "seed-ab12cd");
+	mkdirSync(join(staging, ".codegraph"), { recursive: true });
+	writeFileSync(join(staging, ".codegraph", "codegraph.db"), "empty-parent-copy");
+	const report = await runCodegraphSeedSync(["sync", "-q"], staging, 10_000);
+	assert.deepEqual(report, { ok: true, removedEntries: false }, "a confirmed-empty staged index validates: the sync may still add the worktree's files");
+	assert.equal(existsSync(seenFile), true, "the validating sync ran after the informational empty listing");
+});
+
+test("runCodegraphSeedSync: a source directory whose link cannot be created is copied instead", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX fake-bin harness");
+	const { staging, seen } = seedSyncHarness(t, "seed-copy-fallback", '[ -f "$3/src/a.ts" ] && printf seen >> "$FAKE_SEEN"');
+	// A Windows share takes no junction to a remote directory; a pre-existing staging entry
+	// forces the same link failure here, so the fallback must materialize the sources as a copy.
+	mkdirSync(join(staging, "src"));
+	const report = await runCodegraphSeedSync(["sync", "-q"], staging, 10_000);
+	assert.deepEqual(report, { ok: true, removedEntries: false }, "a copied source tree still validates the staged index");
+	assert.equal(seen(), "seen", "the validating sync saw the worktree's sources through the copy");
+	assert.equal(lstatSync(join(staging, "src")).isSymbolicLink(), false, "the un-linkable source became a real directory in the staging project");
+	assert.equal(readFileSync(join(staging, "src", "a.ts"), "utf8"), "export const a = 1;\n", "the copy carries the worktree's file contents");
+});
+
 test("runCodegraphSeedSync: an ordinary sync outside a seed staging project keeps the boolean report", async (t) => {
 	if (process.platform === "win32") return t.skip("POSIX fake-bin harness");
 	const bin = dir(t, "seed-plain-bin");
@@ -887,7 +1041,7 @@ test("syncBeforeSearch: the daemon-less refresh runs only sync -q; a failure rep
 	const cwd = dir(t, "search-order");
 	const calls: string[] = [];
 	const failures: string[] = [];
-	syncBeforeSearch({
+	await syncBeforeSearch({
 		cwd,
 		run: async (args) => {
 			calls.push(args.join(" "));
@@ -895,7 +1049,6 @@ test("syncBeforeSearch: the daemon-less refresh runs only sync -q; a failure rep
 		},
 		onFailed: (stage) => failures.push(stage),
 	});
-	await settled();
 	assert.deepEqual(calls, ["sync -q"], "no unlock ever precedes the daemon-less sync");
 	assert.deepEqual(failures, ["sync"]);
 });
@@ -907,7 +1060,7 @@ test("syncBeforeSearch: a live daemon syncs only; no daemon runs the same single
 	writeFileSync(socket, "");
 	fakeRegistryRecord(registry, cwd, socket, process.pid);
 	const calls: string[] = [];
-	syncBeforeSearch({
+	await syncBeforeSearch({
 		cwd,
 		registryDir: registry,
 		run: async (args) => {
@@ -915,12 +1068,11 @@ test("syncBeforeSearch: a live daemon syncs only; no daemon runs the same single
 			return true;
 		},
 	});
-	await settled();
 	assert.deepEqual(calls, ["sync -q"], "a live daemon holds the writer lock and is not stale: only the sync runs");
 
 	const deadCwd = dir(t, "search-dead-daemon");
 	const deadCalls: string[] = [];
-	syncBeforeSearch({
+	await syncBeforeSearch({
 		cwd: deadCwd,
 		registryDir: dir(t, "search-dead-registry"),
 		run: async (args) => {
@@ -928,7 +1080,6 @@ test("syncBeforeSearch: a live daemon syncs only; no daemon runs the same single
 			return true;
 		},
 	});
-	await settled();
 	assert.deepEqual(deadCalls, ["sync -q"], "no live daemon: the lease holder refreshes with the sync alone");
 });
 
@@ -938,7 +1089,7 @@ test("syncBeforeSearch: a damaged sync lease reports a blocked refresh and never
 	writeFileSync(lockPathFor(cwd, "sync", locks), "{not-json\n");
 	const calls: string[] = [];
 	const failures: string[] = [];
-	syncBeforeSearch({
+	await syncBeforeSearch({
 		cwd,
 		locksDir: locks,
 		run: async (args) => {
@@ -947,7 +1098,6 @@ test("syncBeforeSearch: a damaged sync lease reports a blocked refresh and never
 		},
 		onFailed: (stage) => failures.push(stage),
 	});
-	await settled();
 	assert.deepEqual(calls, [], "no unlock, no sync: nobody owns this refresh");
 	assert.deepEqual(failures, ["lease"], "the blocked lease is the reported stage");
 });
@@ -984,12 +1134,14 @@ test("syncBeforeSearch: a rejecting run never surfaces an unhandled rejection", 
 	process.on("unhandledRejection", onUnhandled);
 	t.after(() => process.off("unhandledRejection", onUnhandled));
 
-	syncBeforeSearch({
+	await syncBeforeSearch({
 		cwd,
 		run: async () => {
 			throw new Error("refresh exploded");
 		},
 	});
+	// One explicit event-loop checkpoint after job settlement: an unhandled rejection would
+	// surface to the observer here, never before the await returned.
 	await settled();
 
 	assert.deepEqual(rejections, []);
@@ -1175,7 +1327,7 @@ test("syncBeforeSearch: a live sync lease in another session means zero CLI call
 	writeFileSync(lockPathFor(cwd, "sync", locks), `${JSON.stringify({ kind: "sync", pid: process.pid, startedAt: Date.now(), expiresAt: Date.now() + 60_000 })}\n`);
 	const calls: string[] = [];
 	const failures: string[] = [];
-	syncBeforeSearch({
+	await syncBeforeSearch({
 		cwd,
 		locksDir: locks,
 		run: async (args) => {
@@ -1184,7 +1336,6 @@ test("syncBeforeSearch: a live sync lease in another session means zero CLI call
 		},
 		onFailed: (stage) => failures.push(stage),
 	});
-	await settled();
 	assert.deepEqual(calls, [], "no sync: the live lease holder owns this refresh");
 	assert.deepEqual(failures, []);
 });
@@ -1326,20 +1477,57 @@ test("prepareReadiness: a live CodeGraph writer lock means no sync, and ok", asy
 	assert.deepEqual(calls, ["warm"], "a live writer is never refreshed under");
 });
 
+test("prepareReadiness: a symlinked .codegraph directory stands the automatic sync and warm-up down", async (t) => {
+	const real = dir(t, "sync-symlink-real");
+	writeDb(real);
+	const linked = dir(t, "sync-symlink-linked");
+	symlinkSync(join(real, ".codegraph"), join(linked, ".codegraph"));
+	const calls: string[] = [];
+	const result = await prepareReadiness(fakeInput(linked, {
+		locksDir: dir(t, "sync-symlink-locks"),
+		run: async (args) => {
+			calls.push(`run:${args.join(" ")}`);
+			return true;
+		},
+		warm: async () => {
+			calls.push("warm");
+			return true;
+		},
+	}));
+	assert.deepEqual(result, { action: "none", ok: true, warm: "skipped" }, "another checkout's linked index is not this workspace's to sync or warm");
+	assert.deepEqual(calls, [], "no sync and no warm-up ever touch the linked database");
+});
+
 test("syncBeforeSearch: a live CodeGraph writer lock means zero CLI calls", async (t) => {
 	const cwd = dir(t, "search-writer-busy");
 	writeDb(cwd);
 	writeFileSync(join(cwd, ".codegraph", "codegraph.lock"), String(process.pid));
 	const calls: string[] = [];
-	syncBeforeSearch({
+	await syncBeforeSearch({
 		cwd,
 		run: async (args) => {
 			calls.push(args.join(" "));
 			return true;
 		},
 	});
-	await settled();
 	assert.deepEqual(calls, [], "the live writer owns the refresh");
+});
+
+test("syncBeforeSearch: a symlinked .codegraph directory means zero CLI calls", async (t) => {
+	const real = dir(t, "search-symlink-real");
+	writeDb(real);
+	const linked = dir(t, "search-symlink-linked");
+	symlinkSync(join(real, ".codegraph"), join(linked, ".codegraph"));
+	const calls: string[] = [];
+	await syncBeforeSearch({
+		cwd: linked,
+		locksDir: dir(t, "search-symlink-locks"),
+		run: async (args) => {
+			calls.push(args.join(" "));
+			return true;
+		},
+	});
+	assert.deepEqual(calls, [], "the linked checkout's database is never written by the automatic search refresh");
 });
 
 test("prepareReadiness: the init run's spawn lands on the init lease token", async (t) => {
@@ -1435,6 +1623,37 @@ test("prepareReadiness: a sync failing twice beside a live daemon reports daemon
 	assert.deepEqual(events, [{ action: "sync", ok: false, daemonAlive: true, exitCode: 1, stderrTail: "database is locked" }]);
 });
 
+test("prepareReadiness: a backoff that outlives the sync budget returns the first failure without a retry", async (t) => {
+	const cwd = dir(t, "sync-backoff-expired");
+	writeDb(cwd);
+	const registry = dir(t, "sync-backoff-registry");
+	const socket = join(registry, "live.sock");
+	writeFileSync(socket, "");
+	fakeRegistryRecord(registry, cwd, socket, process.pid);
+	const calls: Array<{ args: string; timeoutMs: number }> = [];
+	const realNow = Date.now;
+	let resumedPastDeadline = false;
+	t.mock.method(Date, "now", () => (resumedPastDeadline ? realNow() + SYNC_TIMEOUT_MS + 5_000 : realNow()));
+	t.after(() => {
+		t.mock.restoreAll();
+	});
+	const result = await prepareReadiness(fakeInput(cwd, {
+		registryDir: registry,
+		sleep: async () => {
+			// A suspended host resumes past the deadline mid-backoff: no budget survives for a retry.
+			resumedPastDeadline = true;
+		},
+		run: async (args, _cwd, timeoutMs) => {
+			calls.push({ args: args.join(" "), timeoutMs });
+			return false;
+		},
+		warm: async () => true,
+	}));
+	assert.equal(result.ok, false, "the first failure stands when the backoff outlives the whole budget");
+	assert.deepEqual(calls.map((call) => call.args), ["sync -q"], "no retry starts once the remaining budget is nonpositive");
+	assert.equal(calls[0]?.timeoutMs, SYNC_TIMEOUT_MS, "the one attempt ran with the full budget");
+});
+
 test("prepareReadiness: without a live daemon the sync stays single-shot and reports daemonAlive false", async (t) => {
 	const cwd = dir(t, "sync-dead-single");
 	writeDb(cwd);
@@ -1468,7 +1687,7 @@ test("syncBeforeSearch: beside a live daemon a failed sync retries once; daemon-
 	const calls: string[] = [];
 	const sleeps: number[] = [];
 	const failures: Array<{ stage: string; info: Record<string, unknown> }> = [];
-	syncBeforeSearch({
+	await syncBeforeSearch({
 		cwd,
 		registryDir: registry,
 		sleep: async (ms) => {
@@ -1483,14 +1702,13 @@ test("syncBeforeSearch: beside a live daemon a failed sync retries once; daemon-
 			failures.push({ stage, info: { ...info } });
 		},
 	});
-	await settled();
 	assert.deepEqual(calls, ["sync -q", "sync -q"], "the first failing sync is retried once beside a live daemon");
 	assert.deepEqual(sleeps, [SYNC_RETRY_DELAY_MS]);
 	assert.deepEqual(failures, [], "a successful retry reports nothing");
 
 	const deadCwd = dir(t, "search-dead-detail");
 	const deadFailures: Array<{ stage: string; info: Record<string, unknown> }> = [];
-	syncBeforeSearch({
+	await syncBeforeSearch({
 		cwd: deadCwd,
 		registryDir: dir(t, "search-dead-detail-registry"),
 		run: async () => false,
@@ -1498,7 +1716,6 @@ test("syncBeforeSearch: beside a live daemon a failed sync retries once; daemon-
 			deadFailures.push({ stage, info: { ...info } });
 		},
 	});
-	await settled();
 	assert.deepEqual(deadFailures, [{ stage: "sync", info: { daemonAlive: false } }], "daemon-less failures report daemonAlive false");
 });
 
@@ -1551,6 +1768,42 @@ test("prepareReadiness: a child in its own unindexed linked worktree seeds and n
 	assert.deepEqual(seeded, [worktree], "the un-skipped child seeds its own worktree");
 	assert.deepEqual(calls, [], "no init and no warm ran");
 	assert.deepEqual(events, ["init"], "onIndexed still reports the finished index");
+});
+
+test("prepareReadiness: a child whose worktree index appears mid-gate never syncs it", async (t) => {
+	const { worktree } = worktreePair(t);
+	writeDb(worktree);
+	// The gate must read "absent" while the plan reads "present" — a publish landing exactly
+	// between the two checks. Only the gate's first database stat is intercepted; everything
+	// else sees the real, published index.
+	let gateSawAbsent = false;
+	const realStatSync = fsSync.statSync;
+	const dbPath = join(worktree, ".codegraph", "codegraph.db");
+	t.mock.method(fsSync, "statSync", ((...args: Parameters<typeof fsSync.statSync>) => {
+		if (!gateSawAbsent && String(args[0]) === dbPath) {
+			gateSawAbsent = true;
+			const absent = new Error("simulated pre-publication index") as NodeJS.ErrnoException;
+			absent.code = "ENOENT";
+			throw absent;
+		}
+		return realStatSync(...args);
+	}) as typeof fsSync.statSync);
+	syncBuiltinESMExports();
+	t.after(() => {
+		t.mock.restoreAll();
+		syncBuiltinESMExports();
+	});
+	const calls: string[] = [];
+	const result = await prepareReadiness(fakeInput(worktree, {
+		env: { GENTLE_PI_AGENTS_CHILD: "1" },
+		locksDir: dir(t, "child-publish-locks"),
+		run: async (args) => {
+			calls.push(`run:${args.join(" ")}`);
+			return true;
+		},
+	}));
+	assert.deepEqual(result, { action: "none", ok: true, warm: "skipped" }, "another session just published this index: the child stands down, never syncs");
+	assert.deepEqual(calls, [], "a child session runs no sync of its own");
 });
 
 test("prepareReadiness: a child reload or an indexed worktree still skips entirely", async (t) => {
@@ -1624,7 +1877,9 @@ function recordingSeam(platform: NodeJS.Platform, entry: { node: string; script:
 			return entry;
 		},
 	};
-	return { seam, calls, resolutions };
+	// The count is a getter, not a snapshot: a construction-time copy could never see a later
+	// resolution, so an assertion read after the call can actually fail.
+	return { seam, calls, get resolutions() { return resolutions; } };
 }
 
 test("spawnCodegraph: a resolved win32 shim spawns node with the entrypoint as an argument vector", () => {
@@ -1660,8 +1915,10 @@ test("spawnCodegraph: the fallback still refuses a percent argument", () => {
 });
 
 test("spawnCodegraph: POSIX spawns the plain argument vector and never consults the resolver", () => {
-	const { seam, calls, resolutions } = recordingSeam("linux", RESOLVED);
-	spawnCodegraph(["sync", "-q"], ["ignore", "pipe", "pipe"], seam);
-	assert.equal(resolutions, 0, "S11: the resolver is consulted on win32 only");
-	assert.deepEqual(calls, [{ command: "codegraph", args: ["sync", "-q"], options: { cwd: tmpdir(), env: process.env, detached: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] } }]);
+	const recorded = recordingSeam("linux", RESOLVED);
+	spawnCodegraph(["sync", "-q"], ["ignore", "pipe", "pipe"], recorded.seam);
+	// Read the live count after the call: a construction-time snapshot would still read zero
+	// here even if POSIX had consulted the resolver.
+	assert.equal(recorded.resolutions, 0, "S11: the resolver is consulted on win32 only");
+	assert.deepEqual(recorded.calls, [{ command: "codegraph", args: ["sync", "-q"], options: { cwd: tmpdir(), env: process.env, detached: true, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] } }]);
 });
