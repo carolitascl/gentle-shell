@@ -546,9 +546,68 @@ test("the link-less fallback never replaces a database that appeared meanwhile",
 	const result = await seedWorktreeIndex(input);
 
 	assert.equal(linkAttempts, 1, "the atomic link publish was attempted exactly once before the fallback");
-	assert.equal(result.outcome, "seed-failed", "the copy fallback refuses the occupied name instead of winning it");
+	assert.equal(result.outcome, "seed-failed", "the move fallback refuses the occupied name instead of winning it");
 	assert.equal(readFileSync(join(worktree, ".codegraph", "codegraph.db"), "utf8"), "independent-bytes", "the independent publish survives the fallback");
 	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore", "codegraph.db"], "no staging leftover and nothing the seed did not place is removed");
+});
+
+test("a link-less filesystem moves the validated snapshot into place without copying it", async (t) => {
+	const { worktree } = worktreePair(t);
+	let stagedIdentity: { dev: bigint; ino: bigint; size: number } | undefined;
+	let visibleDuringValidation: boolean | undefined;
+	const { input } = seedHarness(worktree, {
+		link: () => {
+			// A continuously available SMB share refuses CreateHardLinkW: the atomic
+			// link publish is rejected by the filesystem itself, not by a competing writer.
+			throw Object.assign(new Error("hard links are not supported"), { code: "ENOTSUP" });
+		},
+		run: async () => {
+			// Validation runs while the completed snapshot still lives in staging: capture
+			// the staged file's identity there, and confirm the final name is still invisible.
+			const staging = readdirSync(join(worktree, ".codegraph")).find((entry) => entry.startsWith("seed-"));
+			assert.ok(staging, "the staged snapshot exists during validation");
+			const staged = statSync(join(worktree, ".codegraph", staging, ".codegraph", "codegraph.db"), { bigint: true });
+			stagedIdentity = { dev: staged.dev, ino: staged.ino, size: Number(staged.size) };
+			visibleDuringValidation = !fileAbsent(join(worktree, ".codegraph", "codegraph.db"));
+			return true;
+		},
+	});
+
+	const result = await seedWorktreeIndex(input);
+
+	assert.equal(result.outcome, "seeded");
+	assert.equal(visibleDuringValidation, false, "the final name stays invisible to every reader until the completed snapshot is published");
+	assert.ok(stagedIdentity, "the staged file's identity was captured during validation");
+	const published = statSync(join(worktree, ".codegraph", "codegraph.db"), { bigint: true });
+	assert.equal(published.dev, stagedIdentity.dev, "the published database is the staged file itself, on the same filesystem");
+	assert.equal(published.ino, stagedIdentity.ino, "moved, never recopied: no byte of the database is copied on the session's event loop");
+	assert.equal(Number(published.size), stagedIdentity.size, "the final name only ever appears holding the complete file, never an empty-then-growing copy");
+	assert.deepEqual(markerNotes(join(worktree, ".codegraph", "codegraph.db")), ["committed"], "the published database carries the snapshot's committed data");
+	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore", "codegraph.db"], "only the index and its gitignore remain: no staging leftovers");
+});
+
+test("a link-less publish whose move cannot land leaves the final name absent, not an empty claim", async (t) => {
+	const { worktree } = worktreePair(t);
+	const { input } = seedHarness(worktree, {
+		link: () => {
+			throw Object.assign(new Error("hard links are not supported"), { code: "ENOTSUP" });
+		},
+		run: async () => {
+			// Validation passes, but the staged snapshot is gone before publication: the
+			// move finds nothing to land after the claim already holds the final name, and
+			// only the claim this publish placed may be removed.
+			const staging = readdirSync(join(worktree, ".codegraph")).find((entry) => entry.startsWith("seed-"));
+			assert.ok(staging, "the staged snapshot exists during validation");
+			rmSync(join(worktree, ".codegraph", staging), { recursive: true, force: true });
+			return true;
+		},
+	});
+
+	const result = await seedWorktreeIndex(input);
+
+	assert.equal(result.outcome, "seed-failed", "a publish whose move cannot land fails closed");
+	assert.equal(fileAbsent(join(worktree, ".codegraph", "codegraph.db")), true, "the empty claim the failed move left at the final name is removed: never an empty database there");
+	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore"], "no staging leftover and no claim remains");
 });
 
 test("a seed whose init-lock nonce is unreadable at publication stands down", async (t) => {
@@ -579,7 +638,7 @@ test("a seed whose init-lock nonce is unreadable at publication stands down", as
 	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore"], "staging is cleaned and the worktree stays exactly as absent as before");
 });
 
-test("a seed displaced while a transient publication retry waits never publishes over the replacement", async (t) => {
+test("a seed displaced while a transient publication retry waits never publishes", async (t) => {
 	if (process.platform === "win32") return t.skip("chmod-based EACCES is a POSIX retry trigger");
 	// chmod only forces the transient failure where the permission really blocks writes: under
 	// CAP_DAC_OVERRIDE (root) the first placement succeeds, the displacement never happens, and
@@ -612,23 +671,24 @@ test("a seed displaced while a transient publication retry waits never publishes
 		},
 		sleep: async () => {
 			// The retry wait is the displacement window: the lease's TTL elapses while this
-			// seed sits parked, another session reclaims it and publishes a newer index, and
-			// the directory becomes writable again so an unfenced retry would now succeed.
+			// seed sits parked and another session reclaims the lease. The directory becomes
+			// writable again with the destination still empty, so an unfenced retry would now
+			// publish: only the ownership fence can stand the displaced seed down (the occupied
+			// destination is the independent-publish test's case, not this one's).
 			if (displaced) return;
 			displaced = true;
 			chmodSync(join(worktree, ".codegraph"), 0o755);
 			const { expiresAt } = JSON.parse(readFileSync(lockPath, "utf8")) as { expiresAt: number };
 			const reclaimer = tryAcquireLease(lockPath, "init", 600_000, expiresAt + 1_000, worktree);
 			assert.ok(reclaimer, "the other session reclaims the lease during the retry wait");
-			writeFileSync(join(worktree, ".codegraph", "codegraph.db"), "newer-index-bytes");
 		},
 	});
 
 	const result = await seedWorktreeIndex(input);
 
-	assert.equal(result.outcome, "seed-failed", "a seed displaced mid-retry aborts instead of renaming over the replacement holder's index");
-	assert.equal(readFileSync(join(worktree, ".codegraph", "codegraph.db"), "utf8"), "newer-index-bytes", "the newer database the other session published survives");
-	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore", "codegraph.db"], "no staging leftover and no stale seed file is left behind");
+	assert.equal(result.outcome, "seed-failed", "a seed displaced mid-retry aborts instead of publishing on a lease it no longer owns");
+	assert.equal(fileAbsent(join(worktree, ".codegraph", "codegraph.db")), true, "the displaced seed publishes nothing: with the destination left empty, only the ownership fence — not the no-replace placement — stood it down");
+	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore"], "no staging leftover and no stale seed file is left behind");
 });
 
 test("retryTransient retries transient codes with backoff and fails others at once", async () => {
