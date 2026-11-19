@@ -39,7 +39,9 @@ export type ExposureOutcome =
 	/** The update itself failed (an unreadable or unwritable file); that path is left as it was. */
 	| "error"
 	/** The file changed under the update on every bounded retry; nothing was written. */
-	| "conflict";
+	| "conflict"
+	/** Another writer holds the config lock; the update did not run and nothing was written. */
+	| "busy";
 
 export interface EnsureExposureResult {
 	path: string;
@@ -51,6 +53,11 @@ export interface EnsureExposureIo {
 	/** The file's current text, or undefined when it does not exist. */
 	read(path: string): string | undefined;
 	write(path: string, text: string): void;
+	/** Takes the config's exclusive lock for the whole read-modify-write, false when another
+	 * writer holds it; absent means this io cannot coordinate and the update runs unguarded. */
+	acquireLock?(path: string): boolean;
+	/** Always called exactly once after an acquire that returned true. */
+	releaseLock?(path: string): void;
 }
 
 /** Mode used when the update creates a config file because none existed yet. */
@@ -125,9 +132,45 @@ export function atomicWriteFile(path: string, text: string, io: AtomicFileIo = f
 	}
 }
 
+/** How old the lock file may be before a holder that crashed without releasing is considered gone. */
+const LOCK_MAX_AGE_MS = 10_000;
+
+/** The advisory lock file beside the config it guards, hidden like the update's own temp file. */
+function lockPathFor(path: string): string {
+	return join(dirname(path), "." + basename(path) + ".lock");
+}
+
 const defaultIo: EnsureExposureIo = {
 	read: (path) => (existsSync(path) ? readFileSync(path, "utf8") : undefined),
 	write: (path, text) => atomicWriteFile(path, text),
+	acquireLock: (path) => {
+		const lockPath = lockPathFor(path);
+		try {
+			writeFileSync(lockPath, `${process.pid}\n`, { flag: "wx" });
+			return true;
+		} catch {
+			/* held: only a stale lock is taken over below */
+		}
+		try {
+			if (Date.now() - statSync(lockPath).mtimeMs < LOCK_MAX_AGE_MS) return false;
+			unlinkSync(lockPath);
+		} catch {
+			return false;
+		}
+		try {
+			writeFileSync(lockPath, `${process.pid}\n`, { flag: "wx" });
+			return true;
+		} catch {
+			return false;
+		}
+	},
+	releaseLock: (path) => {
+		try {
+			unlinkSync(lockPathFor(path));
+		} catch {
+			/* a lock that already vanished releases nothing */
+		}
+	},
 };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -144,30 +187,42 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * update was computed from immediately before the write, and any change discards that write
  * and restarts the whole read-modify-write from the file's current content — an atomic rename
  * prevents partial writes, not lost updates. The restart is bounded; a file that keeps
- * changing across every attempt is reported as `"conflict"` and left unwritten.
+ * changing across every attempt is reported as `"conflict"` and left unwritten. The whole
+ * update also runs under an exclusive lock beside the config when the io provides one, so two
+ * coordinated writers serialize instead of racing through that window; a lock the update
+ * cannot take is reported as `"busy"`, again with nothing written.
  */
 export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaultIo): EnsureExposureResult {
-	for (let attempt = 1; ; attempt++) {
-		const raw = io.read(path);
-		if (raw === undefined) return { path, outcome: "missing" };
-		let doc: unknown;
-		try {
-			doc = JSON.parse(raw);
-		} catch {
-			return { path, outcome: "unparseable" };
+	// The lock, when the io provides one, spans the complete read-modify-write — every read,
+	// the verification, and the replacement — so two coordinated writers serialize instead of
+	// racing through the verify-to-rename window; a lock the update cannot take means another
+	// writer owns the file right now, and the update publishes nothing.
+	if (io.acquireLock !== undefined && !io.acquireLock(path)) return { path, outcome: "busy" };
+	try {
+		for (let attempt = 1; ; attempt++) {
+			const raw = io.read(path);
+			if (raw === undefined) return { path, outcome: "missing" };
+			let doc: unknown;
+			try {
+				doc = JSON.parse(raw);
+			} catch {
+				return { path, outcome: "unparseable" };
+			}
+			if (!isPlainObject(doc)) return { path, outcome: "unparseable" };
+			const servers = doc.mcpServers;
+			const entry = isPlainObject(servers) ? servers.codegraph : undefined;
+			if (!isPlainObject(entry)) return { path, outcome: "no-server" };
+			if ("exposure" in entry) return { path, outcome: "present" };
+			if (io.read(path) !== raw) {
+				if (attempt >= MAX_UPDATE_ATTEMPTS) return { path, outcome: "conflict" };
+				continue; // a concurrent writer changed the file: restart from its current content
+			}
+			entry.exposure = "direct";
+			io.write(path, `${JSON.stringify(doc, null, 2)}\n`);
+			return { path, outcome: "added" };
 		}
-		if (!isPlainObject(doc)) return { path, outcome: "unparseable" };
-		const servers = doc.mcpServers;
-		const entry = isPlainObject(servers) ? servers.codegraph : undefined;
-		if (!isPlainObject(entry)) return { path, outcome: "no-server" };
-		if ("exposure" in entry) return { path, outcome: "present" };
-		if (io.read(path) !== raw) {
-			if (attempt >= MAX_UPDATE_ATTEMPTS) return { path, outcome: "conflict" };
-			continue; // a concurrent writer changed the file: restart from its current content
-		}
-		entry.exposure = "direct";
-		io.write(path, `${JSON.stringify(doc, null, 2)}\n`);
-		return { path, outcome: "added" };
+	} finally {
+		io.releaseLock?.(path);
 	}
 }
 

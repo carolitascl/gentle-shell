@@ -325,3 +325,64 @@ test("atomicWriteFile: a symlinked config keeps receiving updates through the fi
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+test("ensureDirectExposure: a config another writer has locked is never read or written", () => {
+	const files: Record<string, string> = { "/f": WITH_CODEGRAPH };
+	let reads = 0;
+	let writes = 0;
+	const io: EnsureExposureIo = {
+		read: (path) => {
+			reads += 1;
+			return files[path];
+		},
+		write: (path, text) => {
+			writes += 1;
+			files[path] = text;
+		},
+		acquireLock: () => false,
+		releaseLock: () => {
+			throw new Error("releaseLock must not run without a successful acquire");
+		},
+	};
+	assert.deepEqual(ensureDirectExposure("/f", io), { path: "/f", outcome: "busy" });
+	assert.equal(reads, 0, "the lock is taken before anything is read");
+	assert.equal(writes, 0, "a lock the update cannot take publishes nothing");
+	assert.equal(files["/f"], WITH_CODEGRAPH, "the file is left exactly as it was");
+});
+
+test("ensureDirectExposure: a writer that saves a sibling between the final read and the replacement is serialized, not lost", () => {
+	// The competing writer respects the same lock: it tries to save inside the update's
+	// verify-to-replacement window (hooked at the write itself), is refused while the update
+	// holds the lock, and saves once the holder releases - neither write is lost.
+	const files: Record<string, string> = { "/f": WITH_CODEGRAPH };
+	const held: string[] = [];
+	const deferred: Array<() => void> = [];
+	const competitorSave = () => {
+		const doc = JSON.parse(files["/f"]!) as { mcpServers: { codegraph: object; serena?: { command: string } } };
+		doc.mcpServers.serena = { command: "uvx" };
+		files["/f"] = JSON.stringify(doc, null, 2);
+	};
+	const io: EnsureExposureIo = {
+		read: (path) => files[path],
+		write: (path, text) => {
+			if (!io.acquireLock(path)) deferred.push(competitorSave);
+			files[path] = text;
+		},
+		acquireLock: (path) => {
+			if (held.includes(path)) return false;
+			held.push(path);
+			return true;
+		},
+		releaseLock: (path) => {
+			const at = held.indexOf(path);
+			if (at >= 0) held.splice(at, 1);
+		},
+	};
+	assert.equal(ensureDirectExposure("/f", io).outcome, "added");
+	assert.equal(deferred.length, 1, "the mid-window save was refused while the lock was held");
+	for (const save of deferred) save();
+	const written = JSON.parse(files["/f"]!) as { mcpServers: { codegraph: { exposure: string }; serena: { command: string } } };
+	assert.equal(written.mcpServers.codegraph.exposure, "direct", "the holder's update landed");
+	assert.equal(written.mcpServers.serena.command, "uvx", "the deferred sibling save landed on the updated content: no lost update");
+	assert.deepEqual(held, [], "the lock is released once the update is done");
+});

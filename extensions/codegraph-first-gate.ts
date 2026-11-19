@@ -21,6 +21,13 @@ const MEMORY_GATE_OVERRIDE = "GENTLE_CODEGRAPH_MEMORY_GATE";
 const SEARCH_COMMAND_SNIFF = /\b(?:rg|grep|fd|find|ag|ack)\b/;
 
 /**
+ * The bash-command sniff for the CLI query workflow AGENTS.md credits: codegraph query or
+ * codegraph explore with any arguments (the worktree-dispatch form carries -p); init, status,
+ * and every other subcommand never match.
+ */
+const CLI_QUERY_SNIFF = /\bcodegraph\s+(?:query|explore)\b/;
+
+/**
  * Whether the Memory ordering gate applies to the workspace a memory read runs in: only a
  * workspace that actually has a codegraph index pays the rule, so an unindexed project's memory
  * reads pass with zero graph involvement — the presence probe is a filesystem stat of
@@ -47,7 +54,11 @@ function gateApplies(cwd: unknown): boolean {
  * once the prompt has searched the workspace — a grep, find or ls tool execution, or a bash
  * command naming rg, grep, fd, find, ag or ack — until a codegraph query or explore has
  * finalized in the same user prompt; a graph execution in flight blocks memory reads
- * regardless, so a read never interleaves a live graph call. A prompt with no workspace
+ * regardless, so a read never interleaves a live graph call. The CLI query workflow (a
+ * bash-run codegraph query or explore) counts as that query or explore, start to end. The
+ * gate is also batch-aware: an assistant turn whose tool batch mixes a memory read with a
+ * graph query or explore never admits the memory read, whichever position lists it — a
+ * batch's admitted calls run concurrently, so order inside it cannot satisfy the rule. A prompt with no workspace
  * search is never gated: its memory reads pass with zero graph involvement. The requested
  * operation is tracked from the call's start — an init completion never credits. Credit is
  * end-of-execution only — a failed or unavailable query or explore counts — and, like the
@@ -77,6 +88,11 @@ export default function codegraphFirstGate(pi: ExtensionAPI): void {
 	// The query/explore executions pending finalization, by call id: the end event carries no
 	// arguments, so the requested operation is recorded here when the call starts.
 	const queryExploreExecutions = new Set<string>();
+	// Whether the current assistant turn's tool batch mixes a persistent-memory read with a
+	// graph query or explore: such a batch's memory reads are refused at admission, because Pi
+	// runs a batch's admitted calls concurrently — order inside the batch cannot satisfy the
+	// codegraph-first rule.
+	let batchMixesMemoryWithGraph = false;
 	/** codegraph tool calls count for the window: the session tool and the MCP proxy surface. */
 	const isGraphToolName = (toolName: unknown): boolean =>
 		toolName === "codegraph" || (typeof toolName === "string" && toolName.startsWith("mcp__codegraph__"));
@@ -90,6 +106,34 @@ export default function codegraphFirstGate(pi: ExtensionAPI): void {
 		}
 		return typeof toolName === "string" && (toolName.endsWith("_query") || toolName.endsWith("_explore"));
 	};
+	/** Whether one assistant tool-call block is a graph query or explore on any credited
+	 * surface: the session tool's operation, the MCP proxy's name, or the CLI query workflow
+	 * through bash. */
+	const isGraphQueryCall = (name: unknown, args: unknown): boolean => {
+		if (typeof name !== "string") return false;
+		if (isQueryOrExplore(name, args)) return true;
+		const command = (args as { command?: unknown } | undefined | null)?.command;
+		return name === "bash" && typeof command === "string" && CLI_QUERY_SNIFF.test(command);
+	};
+
+	/** The whole tool batch of one assistant turn, read from the turn's own message: Pi
+	 * prepares and executes the batch's calls only after that message ends, so the batch
+	 * composition is known before any tool_call admission. A batch that mixes a memory read
+	 * with a graph query can never satisfy the ordering rule — its calls run concurrently —
+	 * so the answer marks every memory read of that turn refused, whichever position lists them. */
+	function batchIsMixed(message: unknown): boolean {
+		const content = (message as { content?: unknown } | undefined | null)?.content;
+		if (!Array.isArray(content)) return false;
+		let memory = false;
+		let graph = false;
+		for (const block of content) {
+			const call = block as { type?: unknown; name?: unknown; arguments?: unknown } | undefined | null;
+			if (call?.type !== "toolCall" || typeof call.name !== "string") continue;
+			if (MEMORY_READ_TOOLS.has(call.name)) memory = true;
+			else if (isGraphQueryCall(call.name, call.arguments)) graph = true;
+		}
+		return memory && graph;
+	}
 
 	// A new user prompt starts the Memory ordering window over: codegraph must come first again.
 	// before_agent_start fires once per primary request (a user prompt or sendUserMessage),
@@ -97,6 +141,7 @@ export default function codegraphFirstGate(pi: ExtensionAPI): void {
 	pi.on?.("before_agent_start", () => {
 		credited = false;
 		searchActivity = false;
+		batchMixesMemoryWithGraph = false;
 		activeGraphExecutions.clear();
 		queryExploreExecutions.clear();
 	});
@@ -106,16 +151,22 @@ export default function codegraphFirstGate(pi: ExtensionAPI): void {
 	// without another before_agent_start, so the reset must ride the delivery event too.
 	// The search-activity marker resets with the credit, so a memory-only follow-up such as
 	// "now summarize what changed" is not gated by the searched prompt that came before it.
-	// message_end fires for every message; only a user role resets — assistant, tool-result,
-	// and custom deliveries never expire credit.
+	// message_end fires for every message; a user role resets, and an assistant turn instead
+	// reports its own tool batch (mixed or not) for the batch-aware admission; tool-result and
+	// custom deliveries never expire credit.
 	pi.on?.("message_end", (event) => {
 		try {
 			const role = (event as { message?: { role?: unknown } | undefined | null } | undefined | null)?.message?.role;
 			if (role === "user") {
 				credited = false;
 				searchActivity = false;
+				batchMixesMemoryWithGraph = false;
 				activeGraphExecutions.clear();
 				queryExploreExecutions.clear();
+			} else if (role === "assistant") {
+				// The turn's whole tool batch is visible here, before Pi prepares its calls: mark
+				// whether it mixes memory reads with graph queries so admission can check the batch.
+				batchMixesMemoryWithGraph = batchIsMixed((event as { message?: unknown } | undefined | null)?.message);
 			}
 		} catch {
 			/* a hostile payload must never break the host */
@@ -140,7 +191,16 @@ export default function codegraphFirstGate(pi: ExtensionAPI): void {
 				searchActivity = true;
 			} else if (toolName === "bash") {
 				const command = ((event as { args?: { command?: unknown } | undefined | null } | undefined | null)?.args)?.command;
-				if (typeof command === "string" && SEARCH_COMMAND_SNIFF.test(command)) searchActivity = true;
+				if (typeof command === "string") {
+					if (SEARCH_COMMAND_SNIFF.test(command)) searchActivity = true;
+					// A CLI query or explore through bash is the graph execution AGENTS.md credits for
+					// worktree dispatches: active from its start, credited at its end like any other,
+					// and never for init, status, or another subcommand.
+					if (CLI_QUERY_SNIFF.test(command) && typeof toolCallId === "string") {
+						activeGraphExecutions.add(toolCallId);
+						queryExploreExecutions.add(toolCallId);
+					}
+				}
 			}
 		} catch {
 			/* a hostile payload must never break the host */
@@ -165,13 +225,14 @@ export default function codegraphFirstGate(pi: ExtensionAPI): void {
 
 	// The gate itself: in a workspace the gate applies to, block persistent-memory reads once
 	// the prompt has searched the workspace until the codegraph-first window is credited — and
-	// always while a graph execution is still active; every guard failure (throwing payload,
+	// always while a graph execution is still active or the turn's own batch mixes the read
+	// with one; every guard failure (throwing payload,
 	// malformed toolName, missing workspace) allows the call rather than breaking it.
 	pi.on?.("tool_call", (event, ctx) => {
 		try {
 			const toolName = (event as { toolName?: unknown } | undefined | null)?.toolName;
 			const cwd = (ctx as { cwd?: unknown } | undefined | null)?.cwd;
-			if (typeof toolName === "string" && MEMORY_READ_TOOLS.has(toolName) && gateApplies(cwd) && (activeGraphExecutions.size > 0 || (searchActivity && !credited))) {
+			if (typeof toolName === "string" && MEMORY_READ_TOOLS.has(toolName) && gateApplies(cwd) && (activeGraphExecutions.size > 0 || batchMixesMemoryWithGraph || (searchActivity && !credited))) {
 				return { block: true, reason: BLOCK_REASON };
 			}
 			return undefined;

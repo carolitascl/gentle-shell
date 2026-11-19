@@ -477,3 +477,111 @@ test("(v) a searched prompt passes once credit finalizes, and an in-flight codeg
 	fire(handlers, "tool_execution_end", { toolName: "codegraph", toolCallId: "c2" });
 	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search" }), undefined, "finalized credit passes with no search activity");
 });
+
+test("(w) a CLI query or explore through bash credits like a graph tool call; init and status never do", (t) => {
+	const handlers = installGate(t);
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "tool_execution_start", { toolName: "grep", toolCallId: "w-arm", args: { pattern: "symbol" } });
+	fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: "w1", args: { command: "codegraph query symbol -p /worktree" } });
+	assert.deepEqual(
+		fire(handlers, "tool_call", { toolName: "mem_search" }),
+		{ block: true, reason: BLOCK_REASON },
+		"the CLI query is a graph execution in flight, so the read waits",
+	);
+	fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: "w1" });
+	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search" }), undefined, "a finalized CLI query credits the prompt");
+
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "tool_execution_start", { toolName: "grep", toolCallId: "w-arm-2", args: { pattern: "symbol" } });
+	for (const [id, command] of [
+		["w2", "codegraph init"],
+		["w3", "codegraph status -p /worktree"],
+	] as const) {
+		fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: id, args: { command } });
+		fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: id });
+	}
+	assert.deepEqual(
+		fire(handlers, "tool_call", { toolName: "mem_search" }),
+		{ block: true, reason: BLOCK_REASON },
+		"init and status completions never credit",
+	);
+	fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: "w4", args: { command: "codegraph explore -p /worktree main" } });
+	fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: "w4" });
+	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search" }), undefined, "a finalized CLI explore credits even when it failed");
+});
+
+test("(x) a parallel batch that mixes memory reads with graph calls never admits the memory read, whichever order it lists", (t) => {
+	const handlers = installGate(t);
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	// Pi prepares the batch's calls in source order after the assistant message ends, so the
+	// whole batch is visible before any tool_call admission: mem_search listed FIRST must
+	// still be blocked, not admitted ahead of the graph call it would interleave with.
+	fire(handlers, "message_end", { message: { role: "assistant", content: [
+		{ type: "text", text: "checking" },
+		{ type: "toolCall", id: "m1", name: "mem_search", arguments: { query: "lease" } },
+		{ type: "toolCall", id: "g1", name: "codegraph", arguments: { operation: "query", query: "symbol" } },
+	] } });
+	assert.deepEqual(
+		fire(handlers, "tool_call", { toolName: "mem_search", toolCallId: "m1" }),
+		{ block: true, reason: BLOCK_REASON },
+		"the memory read listed before the graph call is blocked by the batch composition",
+	);
+	// The same batch with the graph call listed first behaves identically.
+	fire(handlers, "message_end", { message: { role: "assistant", content: [
+		{ type: "toolCall", id: "g2", name: "mcp__codegraph__codegraph_explore", arguments: { query: "flow" } },
+		{ type: "toolCall", id: "m2", name: "mem_context", arguments: {} },
+	] } });
+	assert.deepEqual(
+		fire(handlers, "tool_call", { toolName: "mem_context", toolCallId: "m2" }),
+		{ block: true, reason: BLOCK_REASON },
+		"the memory read listed after the graph call is blocked too",
+	);
+	// A CLI query in the batch mixes it just the same.
+	fire(handlers, "message_end", { message: { role: "assistant", content: [
+		{ type: "toolCall", id: "b1", name: "bash", arguments: { command: "codegraph query symbol -p /worktree" } },
+		{ type: "toolCall", id: "m3", name: "mem_search", arguments: { query: "lease" } },
+	] } });
+	assert.deepEqual(
+		fire(handlers, "tool_call", { toolName: "mem_search", toolCallId: "m3" }),
+		{ block: true, reason: BLOCK_REASON },
+		"a bash-run CLI query mixes the batch as surely as the tool call does",
+	);
+	// The mixed batch's own graph calls are never blocked, and the block outlives the batch's
+	// graph credit: the turn's memory reads were refused at admission, not deferred behind it.
+	fire(handlers, "message_end", { message: { role: "assistant", content: [
+		{ type: "toolCall", id: "g3", name: "codegraph", arguments: { operation: "explore", query: "flow" } },
+		{ type: "toolCall", id: "m4", name: "mem_search", arguments: { query: "lease" } },
+	] } });
+	assert.equal(fire(handlers, "tool_call", { toolName: "codegraph", toolCallId: "g3" }), undefined, "the batch's graph call itself is never blocked");
+	fire(handlers, "tool_execution_start", { toolName: "codegraph", toolCallId: "g3", args: { operation: "explore", query: "flow" } });
+	fire(handlers, "tool_execution_end", { toolName: "codegraph", toolCallId: "g3" });
+	assert.deepEqual(
+		fire(handlers, "tool_call", { toolName: "mem_search", toolCallId: "m4" }),
+		{ block: true, reason: BLOCK_REASON },
+		"the mixed turn keeps refusing its memory reads even after the graph call credited",
+	);
+	// A later memory-only batch of the same prompt passes: only mixed batches are refused.
+	fire(handlers, "message_end", { message: { role: "assistant", content: [
+		{ type: "toolCall", id: "m5", name: "mem_search", arguments: { query: "lease" } },
+	] } });
+	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search", toolCallId: "m5" }), undefined, "a memory-only batch after credit is admitted");
+	// A graph-only parallel batch never arms the refusal for the graph tools themselves.
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "message_end", { message: { role: "assistant", content: [
+		{ type: "toolCall", id: "g4", name: "codegraph", arguments: { operation: "query", query: "a" } },
+		{ type: "toolCall", id: "g5", name: "codegraph", arguments: { operation: "query", query: "b" } },
+	] } });
+	assert.equal(fire(handlers, "tool_call", { toolName: "codegraph", toolCallId: "g4" }), undefined);
+	assert.equal(fire(handlers, "tool_call", { toolName: "codegraph", toolCallId: "g5" }), undefined, "a parallel graph-only batch is fully admitted");
+	// A memory-only batch in a fresh unsearched prompt passes (the flag never misfires on it).
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "message_end", { message: { role: "assistant", content: [
+		{ type: "toolCall", id: "m6", name: "mem_search", arguments: { query: "lease" } },
+	] } });
+	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search", toolCallId: "m6" }), undefined, "a memory-only batch without search activity is never blocked");
+	// Hostile assistant payloads never throw and never arm the refusal.
+	for (const content of [undefined, null, 42, "not a batch", {}, { type: "toolCall" }, [{ type: "image" }], [{ type: "toolCall", name: 42 }]]) {
+		assert.doesNotThrow(() => fire(handlers, "message_end", { message: { role: "assistant", content } }), "a hostile batch payload must not throw");
+	}
+	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search" }), undefined, "no hostile payload armed the batch refusal");
+});
