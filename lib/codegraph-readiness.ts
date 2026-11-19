@@ -102,6 +102,10 @@ async function runSyncWithRetry(
 	// budget would still start a real child and run its whole timeout cleanup for nothing —
 	// the first failure stands.
 	if (deadline - Date.now() <= 0) return false;
+	// A `.codegraph` that became a link during the backoff is another checkout's index by now —
+	// the same directory a fresh refresh would refuse — so the retry must not lower the guard
+	// the first attempt ran under.
+	if (!safeIndexDirectory(cwd)) return false;
 	return attempt(Math.max(deadline - Date.now(), 0));
 }
 
@@ -153,6 +157,12 @@ export const INIT_RETRY_COUNT = 3;
 const KILL_WAIT_MS = 10_000;
 /** Grace a timed-out command gets to obey SIGTERM before the unignorable SIGKILL ends its tree. */
 const KILL_ESCALATE_MS = 1_000;
+/** The init lease must outlive every attempt the held-lock retry loop can spend: each attempt
+ * draws its full INIT_TIMEOUT_MS and, when it times out, the runner's SIGKILL grace and kill
+ * wait before the next one starts. A lease covering only a single attempt expires mid-sequence
+ * and a retry would spawn its `init -y` under a lock another session has lawfully reclaimed —
+ * the sequence's bounded worst case is therefore the lease TTL. */
+const INIT_LOCK_SEQUENCE_TTL_MS = (INIT_RETRY_COUNT + 1) * (INIT_TIMEOUT_MS + KILL_ESCALATE_MS + KILL_WAIT_MS);
 /** The environment variable a subagent child carries; children never start an index operation of their own. */
 export const CHILD_ENV = "GENTLE_PI_AGENTS_CHILD";
 /** One of these next to a `.git` is what makes a directory a project worth indexing automatically. */
@@ -231,7 +241,8 @@ const LOCK_LOSER_POLL_MS = 250;
 /** The warm gate's verdict: ok says the daemon is warm, wedged names the state where the
  * daemon is alive and holds the daemon lock but never answers — no spawn ran, so nothing was
  * killed or replaced — and adopted marks a spawn that lost the daemon lock to a racing
- * session's winner and settled on that winner's live daemon instead. */
+ * session's winner and settled on that winner's daemon once it verified an answer, never on
+ * liveness alone. */
 export type WarmUpOutcome = { ok: boolean; wedged?: boolean; adopted?: boolean };
 
 /**
@@ -245,8 +256,9 @@ export type WarmUpOutcome = { ok: boolean; wedged?: boolean; adopted?: boolean }
  * lose the daemon lock to the wedged holder. A spawn that loses the daemon lock to a racing session's
  * winner exits at once — its lock message goes to the daemon's own log (stdio for stderr is "ignore"),
  * so nothing arriving through the pipes identifies it — and the exit polls the registry for the
- * winner's live daemon, liveness only (the winner may still be initializing), resolving
- * { ok: true, adopted: true } when one appears inside the adoption window. Never rejects;
+ * winner's live daemon, a candidate until one real health probe answers — the same verification
+ * the alive short-circuit demands — resolving { ok: true, adopted: true } only for a winner that
+ * actually serves inside the adoption window. Never rejects;
  * `background` unrefs everything so a warm-up still running never keeps its caller alive.
  */
 export async function warmUpDaemonDetailed(cwd: string, background = false, timeoutMs = WARMUP_TIMEOUT_MS, registryDir?: string, helloTimeoutMs?: number, adoptWindowMs?: number): Promise<WarmUpOutcome> {
@@ -352,12 +364,22 @@ export async function warmUpDaemonDetailed(cwd: string, background = false, time
 		// the winner and its lock message went to the daemon's own log (stderr is ignored), so
 		// nothing arriving through these pipes identifies it. Liveness separates that exit from
 		// a real failure: poll the registry for the winner's live daemon — registered, pid
-		// alive, socket present, no health probe, the winner may still be initializing — and
-		// adopt it; nothing appearing inside the adoption window is the failed warm-up of a
-		// child that exited for no better reason.
+		// alive, socket present — and treat it as a candidate the same health probe as the alive
+		// short-circuit must confirm before the adoption settles. A winner that has not
+		// answered yet keeps its chances inside the window; one that never answers, like no
+		// winner appearing at all, is the failed warm-up of a child that exited for no better
+		// reason.
 		child.on("close", () => {
 			if (settled) return;
 			const deadline = Date.now() + adoptionWindow;
+			const scheduleNext = () => {
+				if (Date.now() >= deadline) {
+					settle("failed");
+					return;
+				}
+				adoptTimer = setTimeout(poll, LOCK_LOSER_POLL_MS);
+				if (background) adoptTimer.unref?.();
+			};
 			const poll = () => {
 				// The overall timeout or another settlement path may have finished between ticks.
 				if (settled) return;
@@ -368,15 +390,27 @@ export async function warmUpDaemonDetailed(cwd: string, background = false, time
 					/* an unreadable registry holds no winner to adopt */
 				}
 				if (alive) {
-					settle("adopted");
+					// The winner is a candidate, not a verdict: liveness alone would adopt a wedged
+					// winner — the same daemon the warm gate at the start of this call reports as
+					// wedged. One real answer adopts it; anything else keeps polling for a winner
+					// that can actually serve, within the remaining window the overall timeout caps.
+					void daemonHealth(cwd, registryDir, helloTimeoutMs).then(
+						(health) => {
+							if (settled) return;
+							if (health === "ok") {
+								settle("adopted");
+								return;
+							}
+							scheduleNext();
+						},
+						() => {
+							if (settled) return;
+							scheduleNext();
+						},
+					);
 					return;
 				}
-				if (Date.now() >= deadline) {
-					settle("failed");
-					return;
-				}
-				adoptTimer = setTimeout(poll, LOCK_LOSER_POLL_MS);
-				if (background) adoptTimer.unref?.();
+				scheduleNext();
 			};
 			poll();
 		});
@@ -407,8 +441,11 @@ function safeIndexDirectory(cwd: string): boolean {
 	try {
 		const index = lstatSync(join(cwd, ".codegraph"));
 		return !index.isSymbolicLink() && index.isDirectory();
-	} catch {
-		return true; // absent: the tri-state indexState reports that its own way
+	} catch (error) {
+		// Only a confirmed absence is safe; any other stat failure — permissions, an unreadable
+		// parent — proves nothing about what `.codegraph` is, and the refresh fails closed instead
+		// of writing into a directory it could not see.
+		return (error as NodeJS.ErrnoException).code === "ENOENT";
 	}
 }
 
@@ -582,6 +619,8 @@ export function prepareReadiness(input: ReadinessInput): Promise<ReadinessResult
 					const lock = await acquireInitLock(input.cwd, {
 						locksDir: input.locksDir,
 						waitMs: input.initLockWaitMs,
+						// The lease covers the whole bounded retry sequence the loop below may run.
+						ttlMs: INIT_LOCK_SEQUENCE_TTL_MS,
 					});
 					if (lock.outcome === "acquired") {
 						try {
@@ -773,7 +812,13 @@ function runCodegraphCommand(args: readonly string[], cwd: string, timeoutMs: nu
 			settled = true;
 			clearTimeout(timer);
 			if (grace !== undefined) clearTimeout(grace);
-			opts.onInfo?.({ ok, exitCode, stderrTail: stderrTail.length > 0 ? stderrTail : undefined, stdoutTail: stdoutKept.length > 0 ? stdoutKept.slice(-2_000) : undefined });
+			// The diagnostic sink is best effort: a throwing onInfo must not swallow the command's
+			// actual outcome, or the caller holding a lease for this run would never resolve.
+			try {
+				opts.onInfo?.({ ok, exitCode, stderrTail: stderrTail.length > 0 ? stderrTail : undefined, stdoutTail: stdoutKept.length > 0 ? stdoutKept.slice(-2_000) : undefined });
+			} catch {
+				/* the resolved result below is the contract; the sink's failure is diagnostic only */
+			}
 			resolve({ ok, exitCode, stderrTail: stderrTail.length > 0 ? stderrTail : undefined, stdout: stdoutKept });
 		};
 		let child: ReturnType<typeof spawn> | undefined;
@@ -789,7 +834,11 @@ function runCodegraphCommand(args: readonly string[], cwd: string, timeoutMs: nu
 		} catch (error) {
 			// A refused spawn — cmd.exe cannot carry a literal percent through the .cmd shim — is
 			// a diagnosable failure, not a silent one: the sink sees why no command ran.
-			opts.onInfo?.({ ok: false, stderrTail: firstLineOf(error, 200) });
+			try {
+				opts.onInfo?.({ ok: false, stderrTail: firstLineOf(error, 200) });
+			} catch {
+				/* best-effort diagnostic: the failure result below still resolves */
+			}
 			resolve({ ok: false, stdout: "" });
 			return;
 		}
