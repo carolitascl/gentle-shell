@@ -6,7 +6,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { daemonFor, exploreViaDaemon, liveDaemons, mcpLineReader, mcpReplyKind, parseMcpReply, registeredDaemons, resetDaemonRegistryMemo, setPipeProbeForTests, socketPresent } from "../lib/codegraph-daemon.ts";
+import { daemonFor, daemonHealth, exploreViaDaemon, liveDaemons, mcpLineReader, mcpReplyKind, parseMcpReply, registeredDaemons, resetDaemonRegistryMemo, setPipeProbeForTests, socketPresent } from "../lib/codegraph-daemon.ts";
 import type { McpReply, PipeProbeOutcome } from "../lib/codegraph-daemon.ts";
 import { canonicalRoot } from "../lib/codegraph-canonical.ts";
 
@@ -129,6 +129,21 @@ test("exploreViaDaemon reports a daemon that accepts but never says hello as a t
 		await exploreViaDaemon(project, "codegraph_explore", { query: "main" }, 5_000, daemon.registryDir, 50),
 		{ status: "timeout" },
 	);
+});
+
+test("daemonHealth: a serving daemon is ok, a silent one wedged, no live daemon unreachable", async (t) => {
+	const healthy = dir(t, "health-ok");
+	const good = fakeDaemon(t, healthy, HELLO, INITIALIZED, ANSWER);
+	await good.ready;
+	assert.equal(await daemonHealth(healthy, good.registryDir), "ok", "a daemon that answers the probe serves");
+
+	const wedged = dir(t, "health-wedged");
+	const silent = fakeDaemon(t, wedged, undefined, INITIALIZED, ANSWER);
+	await silent.ready;
+	assert.equal(await daemonHealth(wedged, silent.registryDir, 50), "wedged", "alive but silent is wedged, not unreachable");
+
+	const absent = dir(t, "health-absent");
+	assert.equal(await daemonHealth(absent, join(absent, "registry")), "unreachable", "no live daemon sockets: no connection attempted");
 });
 
 test("null and other non-object JSON replies never reach dispatch on either transport", async (t) => {
