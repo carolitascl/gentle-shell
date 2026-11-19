@@ -25,6 +25,7 @@ import codeGraphTools, {
 	isSameDirectory,
 	isWorkspaceProjectRoot,
 	awaitSearchSync,
+	warmNotice,
 	SYNC_FRESH_WINDOW_MS,
 	type CodeGraphRunner,
 	type DaemonExplore,
@@ -2669,6 +2670,16 @@ test("codegraphSyncFailureNotice: beside a live daemon the note is info with the
 		text: "codegraph sync failed in /repo (daemon alive; its file watcher keeps the index fresh) — killed (timeout)",
 		level: "info",
 	});
+});
+
+test("warmNotice: every warm outcome carries its one notice - the ready line on any ok, wedged and failure warnings otherwise", () => {
+	assert.deepEqual(warmNotice({ ok: true }, "/repo"), { text: "CodeGraph ready in /repo", level: "info" });
+	assert.deepEqual(warmNotice({ ok: true, adopted: true }, "/repo"), { text: "CodeGraph ready in /repo", level: "info" });
+	assert.deepEqual(warmNotice({ ok: false, wedged: true }, "/repo"), {
+		text: "CodeGraph daemon in /repo is not answering; queries use the CLI fallback for now",
+		level: "warning",
+	});
+	assert.deepEqual(warmNotice({ ok: false }, "/repo"), { text: "CodeGraph warm-up failed in /repo", level: "warning" });
 });
 
 test("awaitSearchSync: a failing sync beside a live daemon notifies info, a daemon-less one keeps the warning", async (t) => {
