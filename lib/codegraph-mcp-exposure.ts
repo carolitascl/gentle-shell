@@ -50,6 +50,10 @@ export interface EnsureExposureResult {
 
 /** The file access the ensure needs; injectable so tests never touch a real home. */
 export interface EnsureExposureIo {
+	/** The identity a write to `path` actually lands on — symlinks resolved the way the
+	 * replacement itself resolves them, so every link to one shared file coordinates on one
+	 * lock. Absent means the io cannot resolve and the path as given is the identity. */
+	resolve?(path: string): string;
 	/** The file's current text, or undefined when it does not exist. */
 	read(path: string): string | undefined;
 	write(path: string, text: string): void;
@@ -258,19 +262,50 @@ export function acquireConfigLock(configPath: string): boolean {
 }
 
 /**
- * Releases the config's lock, removing only the file this process's own acquisition still owns:
- * a holder displaced by a takeover leaves the new owner's lock untouched.
+ * Releases the config's lock through the same take-aside protocol a stale takeover uses: the
+ * lock file is renamed aside atomically and deleted only once the moved file is provably this
+ * process's own acquisition token. A holder that paused past a takeover therefore never
+ * unlinks the successor's lock — the moved file is the successor's, so it is restored at the
+ * path, unless a new owner already holds it, in which case the displaced token is dropped and
+ * its holder detects the loss through the ownership check before publishing. No read-then-
+ * unlink sequence remains anywhere in the release, so no gap opens for a takeover to slip
+ * into between the two.
  */
 export function releaseConfigLock(configPath: string): void {
 	const lockPath = lockPathFor(configPath);
 	const token = heldLocks.get(lockPath);
 	heldLocks.delete(lockPath);
 	if (token === undefined) return;
-	if (readLockContent(lockPath) !== token) return;
+	let claim: string | undefined;
 	try {
-		unlinkSync(lockPath);
+		claim = join(dirname(lockPath), "." + basename(lockPath) + ".release-" + randomUUID());
+		renameSync(lockPath, claim);
 	} catch {
-		/* a lock that already vanished releases nothing */
+		return; // the lock path is already gone: there is nothing to release
+	}
+	try {
+		if (readLockContent(claim) === token) {
+			try {
+				unlinkSync(claim);
+			} catch {
+				/* already consumed: the release is done */
+			}
+			return;
+		}
+		// Preempted: the moved file is the successor's lock, not this acquisition's. Restore it
+		// at the path without overwriting anyone — the hard link recreates the path only while
+		// it is free — and drop the displaced token when a new owner already holds the path.
+		try {
+			linkSync(claim, lockPath);
+		} catch {
+			/* a new owner holds the path: the displaced lock cannot be restored */
+		}
+	} finally {
+		try {
+			unlinkSync(claim);
+		} catch {
+			/* consumed by the deletion above, restored by the link, or never created */
+		}
 	}
 }
 
@@ -283,6 +318,7 @@ function ownsConfigLock(configPath: string): boolean {
 }
 
 const defaultIo: EnsureExposureIo = {
+	resolve: (path) => fsIo.resolve(path),
 	read: (path) => (existsSync(path) ? readFileSync(path, "utf8") : undefined),
 	write: (path, text) => atomicWriteFile(path, text),
 	acquireLock: (path) => acquireConfigLock(path),
@@ -309,16 +345,24 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * coordinated writers serialize instead of racing through that window; a lock the update
  * cannot take is reported as `"busy"`, again with nothing written - and so is a lock the update
  * can no longer prove it owns at the publish: a holder displaced by a takeover publishes nothing.
+ * The whole update addresses the destination a write itself resolves to — a symlinked config
+ * and every other link to the same shared file contend on one lock and one file identity,
+ * while the reported path stays the caller's own.
  */
 export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaultIo): EnsureExposureResult {
+	// The lock, the reads, and the publish all address the destination a write itself resolves
+	// to: two mcp.json symlinks to one shared file must contend on one lock, or their updates
+	// race through exactly the window the lock exists to serialize. The caller's own path is
+	// what the result reports.
+	const target = io.resolve?.(path) ?? path;
 	// The lock, when the io provides one, spans the complete read-modify-write — every read,
 	// the verification, and the replacement — so two coordinated writers serialize instead of
 	// racing through the verify-to-rename window; a lock the update cannot take means another
 	// writer owns the file right now, and the update publishes nothing.
-	if (io.acquireLock !== undefined && !io.acquireLock(path)) return { path, outcome: "busy" };
+	if (io.acquireLock !== undefined && !io.acquireLock(target)) return { path, outcome: "busy" };
 	try {
 		for (let attempt = 1; ; attempt++) {
-			const raw = io.read(path);
+			const raw = io.read(target);
 			if (raw === undefined) return { path, outcome: "missing" };
 			let doc: unknown;
 			try {
@@ -331,19 +375,19 @@ export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaul
 			const entry = isPlainObject(servers) ? servers.codegraph : undefined;
 			if (!isPlainObject(entry)) return { path, outcome: "no-server" };
 			if ("exposure" in entry) return { path, outcome: "present" };
-			if (io.read(path) !== raw) {
+			if (io.read(target) !== raw) {
 				if (attempt >= MAX_UPDATE_ATTEMPTS) return { path, outcome: "conflict" };
 				continue; // a concurrent writer changed the file: restart from its current content
 			}
 			entry.exposure = "direct";
 			// A lock taken over mid-update means another writer owns the config now: publish
 			// nothing rather than write under a lock that is no longer this update's own.
-			if (io.acquireLock !== undefined && io.ownsLock !== undefined && !io.ownsLock(path)) return { path, outcome: "busy" };
-			io.write(path, `${JSON.stringify(doc, null, 2)}\n`);
+			if (io.acquireLock !== undefined && io.ownsLock !== undefined && !io.ownsLock(target)) return { path, outcome: "busy" };
+			io.write(target, `${JSON.stringify(doc, null, 2)}\n`);
 			return { path, outcome: "added" };
 		}
 	} finally {
-		io.releaseLock?.(path);
+		io.releaseLock?.(target);
 	}
 }
 

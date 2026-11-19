@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -469,4 +469,65 @@ test("takeOverStaleConfigLock: a contender whose observation predates a replacem
 	assert.equal(takeOverStaleConfigLock(config, { mtimeMs: statSync(lock).mtimeMs, content: readFileSync(lock, "utf8") }), true);
 	assert.equal(existsSync(lock), false, "the genuinely abandoned lock is removed for the next acquisition");
 	assert.deepEqual(readdirSync(dir), ["mcp.json"], "no takeover claim file is left behind");
+});
+
+test("ensureDirectExposure: symlinked configs lock the one destination they share", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-shared-"));
+	try {
+		const shared = join(dir, "shared-mcp.json");
+		writeFileSync(shared, WITH_CODEGRAPH, "utf8");
+		const homes = [join(dir, "home-a"), join(dir, "home-b")];
+		let linked = true;
+		for (const home of homes) {
+			mkdirSync(home);
+			try {
+				symlinkSync(shared, join(home, "mcp.json"));
+			} catch {
+				linked = false;
+			}
+		}
+		if (!linked) {
+			t.skip("symlinks are unavailable on this platform");
+			return;
+		}
+		const resolved = realpathSync(shared);
+		assert.equal(lockPathFor(realpathSync(join(homes[0]!, "mcp.json"))), lockPathFor(resolved), "both links resolve to one lock identity");
+		// While one update holds the destination's lock, an update through the other link
+		// cannot take it: both homes serialize on the file they share.
+		assert.equal(acquireConfigLock(resolved), true);
+		assert.deepEqual(
+			ensureDirectExposure(join(homes[1]!, "mcp.json")),
+			{ path: join(homes[1]!, "mcp.json"), outcome: "busy" },
+			"the shared destination's lock refuses the second link",
+		);
+		assert.equal(readFileSync(shared, "utf8"), WITH_CODEGRAPH, "the refused update wrote nothing");
+		releaseConfigLock(resolved);
+		assert.equal(ensureDirectExposure(join(homes[0]!, "mcp.json")).outcome, "added", "the free shared lock admits the update through either link");
+		const written = JSON.parse(readFileSync(shared, "utf8")) as { mcpServers: { codegraph: { exposure: string } } };
+		assert.equal(written.mcpServers.codegraph.exposure, "direct", "the update landed on the shared file");
+		assert.equal(ensureDirectExposure(join(homes[1]!, "mcp.json")).outcome, "present", "the other link reads the same shared entry");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("releaseConfigLock: a release that resumes after a takeover restores the successor and leaves nothing behind", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-release-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const config = join(dir, "mcp.json");
+	writeFileSync(config, WITH_CODEGRAPH, "utf8");
+	const lock = lockPathFor(config);
+	assert.equal(acquireConfigLock(config), true);
+	// The takeover a paused holder resumes to: the path now carries the successor's token,
+	// and the release must take the file aside before deciding it is not its own - a plain
+	// read-then-unlink would delete the successor's lock in the resumed instant.
+	writeFileSync(lock, "4321:successor\n", "utf8");
+	releaseConfigLock(config);
+	assert.equal(readFileSync(lock, "utf8"), "4321:successor\n", "the successor's lock survives the delayed release");
+	assert.deepEqual(readdirSync(dir).sort(), [".mcp.json.lock", "mcp.json"], "no release claim file is left behind");
+	// A vanished lock path releases silently and stays gone.
+	rmSync(lock);
+	releaseConfigLock(config);
+	assert.equal(existsSync(lock), false, "a vanished lock is not resurrected by its release");
+	assert.deepEqual(readdirSync(dir), ["mcp.json"], "nothing else appears beside the config");
 });
