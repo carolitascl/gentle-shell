@@ -1524,6 +1524,13 @@ export default function codeGraphTools(pi: ExtensionAPI): void {
 					say(notice.text, notice.level);
 					return;
 				}
+				// An init whose silent retries were exhausted is the one failure the user can fix
+				// by hand, so the notice names the action. Every other init failure (a lock held
+				// elsewhere, a seed outcome) keeps the plain line: no retries ran to count.
+				if (result.initAttempts !== undefined && result.initAttempts > 1) {
+					say(`codegraph init failed in ${ctx.cwd} after ${result.initAttempts - 1} retries; run "codegraph init" manually`, "warning");
+					return;
+				}
 				say(`codegraph ${result.action} failed in ${ctx.cwd}`, "warning");
 			},
 			onWarmStart: () => say("warming up CodeGraph...", "info"),
