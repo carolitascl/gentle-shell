@@ -585,3 +585,58 @@ test("(x) a parallel batch that mixes memory reads with graph calls never admits
 	}
 	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search" }), undefined, "no hostile payload armed the batch refusal");
 });
+
+test("(y) the CLI credit needs an executable command position, not quoted command text", (t) => {
+	const handlers = installGate(t);
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "tool_execution_start", { toolName: "grep", toolCallId: "y-arm", args: { pattern: "symbol" } });
+	for (const [id, command] of [
+		["y1", "printf '%s\\n' 'codegraph query symbol'"],
+		["y2", "echo \"before anything else, run codegraph query symbol\""],
+	] as const) {
+		fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: id, args: { command } });
+		assert.deepEqual(
+			fire(handlers, "tool_call", { toolName: "mem_search" }),
+			{ block: true, reason: BLOCK_REASON },
+			id + " while it runs: quoted command text is not a graph execution",
+		);
+		fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: id });
+		assert.deepEqual(
+			fire(handlers, "tool_call", { toolName: "mem_search" }),
+			{ block: true, reason: BLOCK_REASON },
+			"the completed " + id + " never credits the prompt",
+		);
+	}
+	// An actual CLI query in a command position - here after a && - still counts start to end.
+	fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: "y3", args: { command: "cd /tmp && codegraph query symbol" } });
+	assert.deepEqual(
+		fire(handlers, "tool_call", { toolName: "mem_search" }),
+		{ block: true, reason: BLOCK_REASON },
+		"the command-position CLI query is a graph execution while it runs",
+	);
+	fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: "y3" });
+	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search" }), undefined, "a command-position CLI query still credits once finalized");
+});
+
+test("(z) a batch that mixes memory reads with an unrelated _query tool is not a graph batch", (t) => {
+	const handlers = installGate(t);
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "message_end", { message: { role: "assistant", content: [
+		{ type: "toolCall", id: "m1", name: "mem_search", arguments: { query: "lease" } },
+		{ type: "toolCall", id: "q1", name: "mcp__postgres__query", arguments: { sql: "SELECT 1" } },
+	] } });
+	assert.equal(
+		fire(handlers, "tool_call", { toolName: "mem_search", toolCallId: "m1" }),
+		undefined,
+		"an unrelated _query tool does not make the batch a graph batch",
+	);
+	fire(handlers, "message_end", { message: { role: "assistant", content: [
+		{ type: "toolCall", id: "m2", name: "mem_context", arguments: {} },
+		{ type: "toolCall", id: "g1", name: "mcp__codegraph__codegraph_query", arguments: { query: "flow" } },
+	] } });
+	assert.deepEqual(
+		fire(handlers, "tool_call", { toolName: "mem_context", toolCallId: "m2" }),
+		{ block: true, reason: BLOCK_REASON },
+		"a codegraph query in the batch still refuses the turn's memory reads",
+	);
+});

@@ -22,10 +22,13 @@ const SEARCH_COMMAND_SNIFF = /\b(?:rg|grep|fd|find|ag|ack)\b/;
 
 /**
  * The bash-command sniff for the CLI query workflow AGENTS.md credits: codegraph query or
- * codegraph explore with any arguments (the worktree-dispatch form carries -p); init, status,
- * and every other subcommand never match.
+ * codegraph explore in an executable command position - the start of the command or after a
+ * command separator (;, &, |, (, or a newline) - with any arguments (the worktree-dispatch
+ * form carries -p). Quoted command text is not an execution: printf '%s\n' 'codegraph query
+ * symbol' passes the string as data, so the sniff must not match it. init, status, and every
+ * other subcommand never match either.
  */
-const CLI_QUERY_SNIFF = /\bcodegraph\s+(?:query|explore)\b/;
+const CLI_QUERY_SNIFF = /(?:^|[;&|(\n])\s*codegraph\s+(?:query|explore)\b/;
 
 /**
  * Whether the Memory ordering gate applies to the workspace a memory read runs in: only a
@@ -107,11 +110,11 @@ export default function codegraphFirstGate(pi: ExtensionAPI): void {
 		return typeof toolName === "string" && (toolName.endsWith("_query") || toolName.endsWith("_explore"));
 	};
 	/** Whether one assistant tool-call block is a graph query or explore on any credited
-	 * surface: the session tool's operation, the MCP proxy's name, or the CLI query workflow
-	 * through bash. */
+	 * surface: the session tool's operation, a graph tool's MCP proxy name - an unrelated
+	 * *_query tool is not one - or the CLI query workflow through bash. */
 	const isGraphQueryCall = (name: unknown, args: unknown): boolean => {
 		if (typeof name !== "string") return false;
-		if (isQueryOrExplore(name, args)) return true;
+		if (isGraphToolName(name) && isQueryOrExplore(name, args)) return true;
 		const command = (args as { command?: unknown } | undefined | null)?.command;
 		return name === "bash" && typeof command === "string" && CLI_QUERY_SNIFF.test(command);
 	};

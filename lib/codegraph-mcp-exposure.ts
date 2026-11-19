@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -58,6 +58,11 @@ export interface EnsureExposureIo {
 	acquireLock?(path: string): boolean;
 	/** Always called exactly once after an acquire that returned true. */
 	releaseLock?(path: string): void;
+	/** Whether the lock acquired for `path` still belongs to this update's own acquisition;
+	 * checked immediately before the publish so a holder displaced by a stale takeover
+	 * publishes nothing. Absent means the io cannot verify ownership and the publish is
+	 * unguarded by it. */
+	ownsLock?(path: string): boolean;
 }
 
 /** Mode used when the update creates a config file because none existed yet. */
@@ -135,42 +140,154 @@ export function atomicWriteFile(path: string, text: string, io: AtomicFileIo = f
 /** How old the lock file may be before a holder that crashed without releasing is considered gone. */
 const LOCK_MAX_AGE_MS = 10_000;
 
-/** The advisory lock file beside the config it guards, hidden like the update's own temp file. */
-function lockPathFor(path: string): string {
+/** The advisory lock file beside the config it guards, hidden like the update's own temp file.
+ * Exported so the suite can stage the lock files its protocol tests examine. */
+export function lockPathFor(path: string): string {
 	return join(dirname(path), "." + basename(path) + ".lock");
+}
+
+/** The locks this process currently holds, by lock path: the owner token each acquisition wrote.
+ * Release and the pre-publish ownership check compare the file's current content with it, so a
+ * lock taken over by another writer is neither removed nor published on as if it were still ours. */
+const heldLocks = new Map<string, string>();
+
+/** One acquisition's owner token: the pid plus a per-acquisition nonce, so a takeover by another
+ * writer is always a content change the displaced holder can detect. */
+function lockOwnerToken(): string {
+	return process.pid + ":" + randomUUID() + "\n";
+}
+
+/** A lock file's whole content, or undefined when it cannot be read. */
+function readLockContent(lockPath: string): string | undefined {
+	try {
+		return readFileSync(lockPath, "utf8");
+	} catch {
+		return undefined;
+	}
+}
+
+/** The identity a stale-recovery decision was made from: the mtime the holder was declared gone
+ * by, and the owner token that file carried at that moment. */
+interface LockObservation {
+	mtimeMs: number;
+	content: string;
+}
+
+/**
+ * The stale-recovery step of the lock acquisition, exported with the observation injectable so
+ * the suite can drive the preempted-contender window deterministically. The takeover renames the
+ * lock path aside - atomic, so of two contenders on the same abandoned lock only the one whose
+ * rename still finds the path proceeds - and then verifies the moved file is the very identity
+ * observed stale, by mtime and owner token: a lock replaced after the observation, another
+ * contender's fresh acquisition, is restored at the path, never adopted or deleted, so a delayed
+ * contender cannot delete the winner's lock and double-acquire. An observed lock younger than
+ * LOCK_MAX_AGE_MS never gets past the staleness check at all.
+ */
+export function takeOverStaleConfigLock(configPath: string, observed?: LockObservation): boolean {
+	const lockPath = lockPathFor(configPath);
+	if (observed === undefined) {
+		try {
+			const stats = statSync(lockPath);
+			const content = readLockContent(lockPath);
+			if (content === undefined) return false;
+			observed = { mtimeMs: stats.mtimeMs, content };
+		} catch {
+			return false;
+		}
+	}
+	if (Date.now() - observed.mtimeMs < LOCK_MAX_AGE_MS) return false;
+	let claim: string | undefined;
+	try {
+		claim = join(dirname(lockPath), "." + basename(lockPath) + ".stale-" + randomUUID());
+		renameSync(lockPath, claim);
+		let movedIsObserved = false;
+		try {
+			movedIsObserved = statSync(claim).mtimeMs === observed.mtimeMs && readLockContent(claim) === observed.content;
+		} catch {
+			/* the moved file is unreadable: not provably the observed one */
+		}
+		if (!movedIsObserved) {
+			// The lock at the path was replaced after the observation. Restore the replacement
+			// without overwriting anyone: the hard link recreates the path only while it is
+			// free, and if another owner already took it the displaced lock is dropped - its
+			// holder detects the loss through the ownership check before publishing.
+			try {
+				linkSync(claim, lockPath);
+			} catch {
+				/* a new owner holds the path: the replacement cannot be restored */
+			}
+			return false;
+		}
+	} catch {
+		return false;
+	} finally {
+		if (claim !== undefined) {
+			try {
+				unlinkSync(claim);
+			} catch {
+				/* a consumed, restored, or never-created claim needs no cleanup */
+			}
+		}
+	}
+	return true;
+}
+
+/**
+ * Acquires the config's advisory lock for this process: a fresh exclusive create when the path
+ * is free, the stale-recovery takeover otherwise. The lock file carries this acquisition's
+ * owner token, so a holder displaced by a LOCK_MAX_AGE_MS takeover can detect the displacement
+ * before it publishes. Exported with its counterpart so the suite can exercise the real
+ * protocol on real files; defaultIo is the only production caller.
+ */
+export function acquireConfigLock(configPath: string): boolean {
+	const lockPath = lockPathFor(configPath);
+	const token = lockOwnerToken();
+	try {
+		writeFileSync(lockPath, token, { flag: "wx" });
+	} catch {
+		/* held: only a stale lock is taken over below */
+		if (!takeOverStaleConfigLock(configPath)) return false;
+		try {
+			writeFileSync(lockPath, token, { flag: "wx" });
+		} catch {
+			return false;
+		}
+	}
+	heldLocks.set(lockPath, token);
+	return true;
+}
+
+/**
+ * Releases the config's lock, removing only the file this process's own acquisition still owns:
+ * a holder displaced by a takeover leaves the new owner's lock untouched.
+ */
+export function releaseConfigLock(configPath: string): void {
+	const lockPath = lockPathFor(configPath);
+	const token = heldLocks.get(lockPath);
+	heldLocks.delete(lockPath);
+	if (token === undefined) return;
+	if (readLockContent(lockPath) !== token) return;
+	try {
+		unlinkSync(lockPath);
+	} catch {
+		/* a lock that already vanished releases nothing */
+	}
+}
+
+/** Whether the config's lock still carries this process's own latest acquisition token. */
+function ownsConfigLock(configPath: string): boolean {
+	const lockPath = lockPathFor(configPath);
+	const token = heldLocks.get(lockPath);
+	if (token === undefined) return false;
+	return readLockContent(lockPath) === token;
 }
 
 const defaultIo: EnsureExposureIo = {
 	read: (path) => (existsSync(path) ? readFileSync(path, "utf8") : undefined),
 	write: (path, text) => atomicWriteFile(path, text),
-	acquireLock: (path) => {
-		const lockPath = lockPathFor(path);
-		try {
-			writeFileSync(lockPath, `${process.pid}\n`, { flag: "wx" });
-			return true;
-		} catch {
-			/* held: only a stale lock is taken over below */
-		}
-		try {
-			if (Date.now() - statSync(lockPath).mtimeMs < LOCK_MAX_AGE_MS) return false;
-			unlinkSync(lockPath);
-		} catch {
-			return false;
-		}
-		try {
-			writeFileSync(lockPath, `${process.pid}\n`, { flag: "wx" });
-			return true;
-		} catch {
-			return false;
-		}
-	},
-	releaseLock: (path) => {
-		try {
-			unlinkSync(lockPathFor(path));
-		} catch {
-			/* a lock that already vanished releases nothing */
-		}
-	},
+	acquireLock: (path) => acquireConfigLock(path),
+	releaseLock: (path) => releaseConfigLock(path),
+	ownsLock: (path) => ownsConfigLock(path),
 };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -190,7 +307,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * changing across every attempt is reported as `"conflict"` and left unwritten. The whole
  * update also runs under an exclusive lock beside the config when the io provides one, so two
  * coordinated writers serialize instead of racing through that window; a lock the update
- * cannot take is reported as `"busy"`, again with nothing written.
+ * cannot take is reported as `"busy"`, again with nothing written - and so is a lock the update
+ * can no longer prove it owns at the publish: a holder displaced by a takeover publishes nothing.
  */
 export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaultIo): EnsureExposureResult {
 	// The lock, when the io provides one, spans the complete read-modify-write — every read,
@@ -218,6 +336,9 @@ export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaul
 				continue; // a concurrent writer changed the file: restart from its current content
 			}
 			entry.exposure = "direct";
+			// A lock taken over mid-update means another writer owns the config now: publish
+			// nothing rather than write under a lock that is no longer this update's own.
+			if (io.acquireLock !== undefined && io.ownsLock !== undefined && !io.ownsLock(path)) return { path, outcome: "busy" };
 			io.write(path, `${JSON.stringify(doc, null, 2)}\n`);
 			return { path, outcome: "added" };
 		}

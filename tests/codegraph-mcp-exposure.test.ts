@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
-import { chmodSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+	acquireConfigLock,
 	atomicWriteFile,
 	codegraphMcpPaths,
 	ensureDirectExposure,
 	ensureDirectExposureInAgentHomes,
+	lockPathFor,
+	releaseConfigLock,
+	takeOverStaleConfigLock,
 	type AtomicFileIo,
 	type EnsureExposureIo,
 } from "../lib/codegraph-mcp-exposure.ts";
@@ -385,4 +389,84 @@ test("ensureDirectExposure: a writer that saves a sibling between the final read
 	assert.equal(written.mcpServers.codegraph.exposure, "direct", "the holder's update landed");
 	assert.equal(written.mcpServers.serena.command, "uvx", "the deferred sibling save landed on the updated content: no lost update");
 	assert.deepEqual(held, [], "the lock is released once the update is done");
+});
+
+test("ensureDirectExposure: a holder whose lock was taken over mid-update publishes nothing", () => {
+	const files: Record<string, string> = { "/f": WITH_CODEGRAPH, "/g": WITH_CODEGRAPH };
+	let writes = 0;
+	const io: EnsureExposureIo = {
+		read: (path) => files[path],
+		write: (path, text) => {
+			writes += 1;
+			files[path] = text;
+		},
+		acquireLock: () => true,
+		releaseLock: () => {},
+		ownsLock: (path) => path === "/g",
+	};
+	assert.equal(ensureDirectExposure("/f", io).outcome, "busy", "another writer owns the lock now: exclusive access is unavailable");
+	assert.equal(writes, 0, "the displaced holder publishes nothing");
+	assert.equal(files["/f"], WITH_CODEGRAPH, "the config is left exactly as it was");
+	assert.equal(ensureDirectExposure("/g", io).outcome, "added", "the same io publishes while it still owns its lock");
+	assert.equal(writes, 1);
+});
+
+test("acquireConfigLock and releaseConfigLock: release removes only the lock this acquisition still owns", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-lock-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const config = join(dir, "mcp.json");
+	writeFileSync(config, WITH_CODEGRAPH, "utf8");
+	const lock = lockPathFor(config);
+	assert.equal(acquireConfigLock(config), true, "a free lock path is acquired");
+	// A stale takeover by another writer between acquire and release: the file at the lock path
+	// now carries the new owner's token.
+	writeFileSync(lock, "1:displaced\n", "utf8");
+	releaseConfigLock(config);
+	assert.equal(readFileSync(lock, "utf8"), "1:displaced\n", "the displaced holder's release leaves the new owner's lock");
+	assert.equal(acquireConfigLock(config), false, "the replacement lock is fresh, so a new contender stands down");
+	rmSync(lock);
+	assert.equal(acquireConfigLock(config), true);
+	releaseConfigLock(config);
+	assert.equal(existsSync(lock), false, "the holder's own lock is removed on release");
+});
+
+test("acquireConfigLock: an abandoned lock is recovered by exactly one of two contenders", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-stale-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const config = join(dir, "mcp.json");
+	writeFileSync(config, WITH_CODEGRAPH, "utf8");
+	const lock = lockPathFor(config);
+	writeFileSync(lock, "123\n", "utf8");
+	const abandoned = new Date(Date.now() - 60_000);
+	utimesSync(lock, abandoned, abandoned);
+	assert.equal(acquireConfigLock(config), true, "the first contender recovers the abandoned lock");
+	assert.equal(acquireConfigLock(config), false, "the second contender finds the recovered lock fresh and stands down");
+	assert.notEqual(readFileSync(lock, "utf8"), "123\n", "the abandoned owner's file was replaced, not reused");
+	releaseConfigLock(config);
+	assert.equal(existsSync(lock), false);
+	assert.deepEqual(readdirSync(dir), ["mcp.json"], "no takeover claim file is left behind");
+});
+
+test("takeOverStaleConfigLock: a contender whose observation predates a replacement never deletes it", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-preempt-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const config = join(dir, "mcp.json");
+	writeFileSync(config, WITH_CODEGRAPH, "utf8");
+	const lock = lockPathFor(config);
+	writeFileSync(lock, "9:crashed\n", "utf8");
+	const abandoned = new Date(Date.now() - 60_000);
+	utimesSync(lock, abandoned, abandoned);
+	const observed = { mtimeMs: statSync(lock).mtimeMs, content: readFileSync(lock, "utf8") };
+	// Between this contender's observation and its takeover, another writer recovers the lock -
+	// worst case, its fresh lock carries the very mtime the contender observed.
+	rmSync(lock);
+	writeFileSync(lock, "7:fresh\n", "utf8");
+	utimesSync(lock, new Date(observed.mtimeMs), new Date(observed.mtimeMs));
+	assert.equal(takeOverStaleConfigLock(config, observed), false, "the delayed takeover is refused");
+	assert.equal(readFileSync(lock, "utf8"), "7:fresh\n", "the winner's lock survives the delayed contender");
+	assert.deepEqual(readdirSync(dir).sort(), [".mcp.json.lock", "mcp.json"], "the replacement is restored at the lock path with no leftover claim");
+	// The same takeover proceeds when the path still holds the observed stale identity.
+	assert.equal(takeOverStaleConfigLock(config, { mtimeMs: statSync(lock).mtimeMs, content: readFileSync(lock, "utf8") }), true);
+	assert.equal(existsSync(lock), false, "the genuinely abandoned lock is removed for the next acquisition");
+	assert.deepEqual(readdirSync(dir), ["mcp.json"], "no takeover claim file is left behind");
 });
