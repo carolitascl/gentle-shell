@@ -7,9 +7,9 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { clearCodegraphResolveCache, resolveCodegraphEntry } from "../lib/codegraph-cli-resolve.ts";
+import { clearCodegraphResolveCache, resolveCodegraphShimState } from "../lib/codegraph-cli-resolve.ts";
 import { MAX_REPLY_CHARS, resetDaemonRegistryMemo, type DaemonCallResult } from "../lib/codegraph-daemon.ts";
-import type { InitLockOutcome } from "../lib/codegraph-lease.ts";
+import { leaseHostIdentity, leaseMachineIdentity, lockPathFor, type InitLockOutcome } from "../lib/codegraph-lease.ts";
 import type { EnsureExposureIo } from "../lib/codegraph-mcp-exposure.ts";
 import { SYNC_RETRY_DELAY_MS, SYNC_TIMEOUT_MS, WARMUP_TIMEOUT_MS, type IndexState } from "../lib/codegraph-readiness.ts";
 import codeGraphTools, {
@@ -17,6 +17,7 @@ import codeGraphTools, {
 	armCodegraphExecForTest,
 	armExposureEnsureForTest,
 	armIndexStateForTest,
+	armStartupDaemonSkipForTest,
 	clearSearchWindow,
 	createCodeGraphTool,
 	codeGraphNodeScript,
@@ -27,6 +28,7 @@ import codeGraphTools, {
 	awaitSearchSync,
 	warmNotice,
 	indexStartNotice,
+	indexedNotice,
 	SYNC_FRESH_WINDOW_MS,
 	type CodeGraphRunner,
 	type DaemonExplore,
@@ -314,33 +316,57 @@ test("a daemon attempt the caller aborts mid-flight is discarded without paying 
 	assert.equal((result.details as { status?: string }).status, "failed");
 });
 test("a cancellation that lands during the sync wait never starts the first daemon attempt", async (t) => {
+	withoutChildEnv(t);
 	const cwd = workspace(t);
+	await writeIndex(["init", cwd], { cwd, maxBuffer: 1 });
 	const ctx = { cwd } as ExtensionContext;
 	let attempts = 0;
 	let runnerCalls = 0;
-	const caller = new AbortController();
-	// The abort fires between the search's entry check and its first daemon attempt: the
-	// re-warm runs before the sync wait, so this seam cancels after entry but before the
-	// attempt — the exact window where a discarded answer would still open a socket.
+	let refreshStarted: (() => void) | undefined;
+	const started = new Promise<void>((resolve) => {
+		refreshStarted = resolve;
+	});
+	let release: (() => void) | undefined;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
 	const tool = createCodeGraphTool(async () => {
 		runnerCalls += 1;
 		return { stdout: "cli answer", stderr: "" };
 	}, {
 		daemonExplore: async () => {
 			attempts += 1;
-			return { status: "ok" as const, text: "daemon answer" };
+			return { status: "ok", text: "daemon answer" };
 		},
-		rewarm: () => {
-			caller.abort();
-		},
+		rewarm: noRewarm,
 		warm: async () => true,
-		syncRun: syncNothing,
+		// A gated refresh over a real index: the abort below lands while the sync is still in
+		// flight, not before it starts.
+		syncRun: async () => {
+			refreshStarted?.();
+			await gate;
+			return true;
+		},
 	});
-	const result = await tool.execute("test", { operation: "query", query: "symbol" }, caller.signal, undefined, ctx);
-	assert.equal(attempts, 0, "a cancelled search must not open a daemon socket whose answer nobody waits for");
-	assert.equal(runnerCalls, 0, "a cancelled search must not pay for the CLI fallback");
+	const caller = new AbortController();
+
+	const search = tool.execute("test", { operation: "query", query: "symbol" }, caller.signal, undefined, ctx);
+	await started;
+	caller.abort();
+	const result = await Promise.race([
+		search,
+		new Promise<never>((_, reject) => setTimeout(() => reject(new Error("the aborted search never returned")), 3_000)),
+	]);
+
+	assert.equal(attempts, 0, "a search cancelled mid-refresh must not open a daemon socket whose answer nobody waits for");
+	assert.equal(runnerCalls, 0, "a search cancelled mid-refresh must not pay for the CLI fallback");
 	assert.match(result.content[0].text, /CodeGraph failed to run/);
 	assert.equal((result.details as { status?: string }).status, "failed");
+
+	// The shared refresh keeps running for the callers still awaiting it: release it so its
+	// job settles and the test leaves nothing blocked.
+	release?.();
+	await settled();
 });
 
 test("an already-aborted caller returns the abort failure before the re-warm, background sync, and first daemon attempt", async (t) => {
@@ -543,6 +569,26 @@ test("CodeGraph tool asks git once per cwd per turn, not once per search", async
 	clearSearchWindow();
 	await tool.execute("test", { operation: "query", query: "third" }, undefined, undefined, ctx);
 	assert.equal(gitCalls.length, firstSearch * 2, "a new turn asks git again, exactly once");
+});
+
+test("a cached workspace validation survives only while the checkout keeps its Git root", async (t) => {
+	const cwd = workspace(t);
+	const tool = createCodeGraphTool(async () => ({ stdout: "unused", stderr: "" }), {
+		daemonExplore: daemonOk,
+		rewarm: noRewarm,
+		syncRun: syncNothing,
+	});
+	const ctx = { cwd } as ExtensionContext;
+
+	await tool.execute("test", { operation: "query", query: "first" }, undefined, undefined, ctx);
+
+	// The checkout loses its .git mid-prompt: realpath and the directory check still pass,
+	// so only a revalidated cache can keep the Git-root requirement honest.
+	rmSync(join(cwd, ".git"), { recursive: true, force: true });
+	await assert.rejects(
+		() => tool.execute("test", { operation: "query", query: "second" }, undefined, undefined, ctx),
+		/real Git project root equal to the current workspace/i,
+	);
 });
 
 test("CodeGraph init reports the missing binary distinctly", async (t) => {
@@ -1291,6 +1337,34 @@ async function spacedWorkspaces(t: test.TestContext): Promise<{ indexed: string;
 	return { indexed, fresh: under("fresh checkout") };
 }
 
+test("the tool_call guard judges a rebuild from the directory the command list changed into", async (t) => {
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+	codeGraphTools({
+		registerTool() { /* the registered tool's shape is covered above */ },
+		on(event, handler) { handlers.set(event, handler); },
+	} as unknown as ExtensionAPI);
+	const guard = handlers.get("tool_call");
+	const { indexed, fresh } = await spacedWorkspaces(t);
+	const previousOverride = process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	t.after(() => {
+		if (previousOverride === undefined) delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+		else process.env.GENTLE_CODEGRAPH_ALLOW_INDEX = previousOverride;
+	});
+	const verdictFrom = (cwd: string, command: string) =>
+		(guard as (event: unknown, ctx: unknown) => unknown)({ toolName: "bash", input: { command } }, { cwd } as ExtensionContext);
+	const shellQuoted = (path: string) => "'" + path + "'";
+
+	assert.equal(verdictFrom(indexed, "cd " + shellQuoted(fresh) + " && codegraph init"), undefined, "an init run inside the unindexed sibling is that sibling's legitimate first init");
+	assert.equal(verdictFrom(indexed, "cd " + shellQuoted(fresh) + " && codegraph index"), undefined, "the index form finds no initialized target at or above the sibling either");
+	const reversed = verdictFrom(fresh, "cd " + shellQuoted(indexed) + " && codegraph init") as { block?: boolean; reason?: string } | undefined;
+	assert.equal(reversed?.block, true, "an init run inside the indexed sibling would rebuild its index");
+	assert.match(reversed?.reason ?? "", /an index already exists/);
+	const unknowable = verdictFrom(fresh, "cd $TARGET && codegraph init") as { block?: boolean } | undefined;
+	assert.equal(unknowable?.block, true, "a cd this walk cannot follow never leaves the caller's directory as proof the target is unindexed");
+	assert.equal(verdictFrom(fresh, "cd $TARGET && GENTLE_CODEGRAPH_ALLOW_INDEX=1 codegraph init"), undefined, "the override on the rebuild itself still authorizes it");
+});
+
 test("the guard's inline override honors the last GENTLE_CODEGRAPH_ALLOW_INDEX assignment", async (t) => {
 	const verdict = await guardOnIndexedWorkspace(t);
 	const superseded = verdict("GENTLE_CODEGRAPH_ALLOW_INDEX=1 GENTLE_CODEGRAPH_ALLOW_INDEX=0 codegraph index .") as { block?: boolean; reason?: string } | undefined;
@@ -1408,6 +1482,20 @@ test("the guard ignores here-document operators inside Bash comments", async (t)
 	assert.equal(verdict("echo foo#bar <<EOF\ncodegraph index .\nEOF"), undefined, "a # mid-word starts no comment: the here-document body stays the command's input");
 });
 
+test("the guard keeps an escaped space inside the word: # after it starts no comment", async (t) => {
+	const verdict = await guardOnIndexedWorkspace(t);
+	// Assembled from char codes: a backslash-before-space literal is corruption-prone in generated code.
+	const escapedSpace = String.fromCharCode(92) + " ";
+	const newline = String.fromCharCode(10);
+	// The escaped space keeps the word open, so the # after it is a literal argument and the
+	// <<'EOF' operator is real: the body's example rebuild is the command's input, never a command.
+	const escaped = verdict("cat foo" + escapedSpace + "#note <<'EOF'" + newline + "codegraph index ." + newline + "EOF");
+	assert.equal(escaped, undefined, "an escaped space is not a comment boundary: the here-document body stays data");
+	// The unescaped form is a real comment: its << opens nothing, so the next line's rebuild is a command.
+	const commented = verdict("cat foo #note <<'EOF'" + newline + "codegraph index ." + newline + "EOF") as { block?: boolean } | undefined;
+	assert.equal(commented?.block, true, "a real comment's operator opens nothing: the following rebuild runs and is blocked");
+});
+
 function writeCodeGraphPackage(binDir: string, scriptSource = "#!/usr/bin/env node\n"): string {
 	const pkgRoot = join(binDir, "node_modules", "@colbymchenry", "codegraph");
 	mkdirSync(pkgRoot, { recursive: true });
@@ -1487,7 +1575,7 @@ test("Windows launcher passes command metacharacters as one literal argv value",
 	withoutChildEnv(t);
 	const binDir = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-bin-")));
 	t.after(() => rmSync(binDir, { recursive: true, force: true }));
-	writeCodeGraphPackage(binDir, "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
+	const entryScript = writeCodeGraphPackage(binDir, "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
 	// A workspace path carrying a literal metacharacter: "&" splits a command under any
 	// shell reinterpretation, so the child receiving the path as ONE argv value is the
 	// no-shell proof the test title names.
@@ -1506,6 +1594,11 @@ test("Windows launcher passes command metacharacters as one literal argv value",
 	const previousPlatform = process.platform;
 	Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
 	t.after(() => Object.defineProperty(process, "platform", { configurable: true, value: previousPlatform }));
+	// The pinned entry keeps the real process boundary under test on every host: the resolver
+	// answers process.execPath + the fixture's npm-shim.js, so no CodeGraph installation is
+	// needed and the handcrafted .cmd's rejection cannot skip the spawn.
+	const restoreResolver = armCodegraphEntryResolverForTest(() => ({ status: "entry", entry: { node: process.execPath, script: entryScript } }));
+	t.after(restoreResolver);
 
 	const result = await createCodeGraphTool(undefined, { initLock: lockAcquired }).execute(
 		"test",
@@ -1639,9 +1732,9 @@ test("win32: a genuine miss keeps the cascade: no shim, no scan anchor, unavaila
 	withoutChildEnv(t);
 	const binDir = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-miss-bin-")));
 	t.after(() => rmSync(binDir, { recursive: true, force: true }));
-	// The package without its shim: no codegraph.cmd anywhere on PATH, so the resolution is
-	// a genuine miss (nothing was rejected) and the per-call scan keeps its turn, finding no
-	// anchor to expand.
+	// The package without its shim: no codegraph.cmd anywhere on the fixture PATH, so the
+	// resolution is a genuine miss (nothing was rejected) and the per-call scan keeps its
+	// turn, finding no anchor to expand.
 	writeCodeGraphPackage(binDir, "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
 	rmSync(join(binDir, "codegraph.cmd"));
 	writePwdGitShim(binDir);
@@ -1650,7 +1743,21 @@ test("win32: a genuine miss keeps the cascade: no shim, no scan anchor, unavaila
 	withPlatform(t, "win32");
 	clearCodegraphResolveCache();
 	t.after(() => clearCodegraphResolveCache());
-	assert.equal(resolveCodegraphEntry(), null, "no shim on PATH resolves to nothing");
+	// The miss is asserted on an isolated PATH a developer's installed shim can never
+	// enter, so the assertion means the same thing on every host.
+	assert.equal(
+		resolveCodegraphShimState({ platform: () => "win32", pathEnv: () => binDir, exists: (path) => existsSync(path), read: (path) => readFileSync(path, "utf8") }).status,
+		"miss",
+		"no shim on the isolated PATH resolves to a miss",
+	);
+	// The exec seam records every spawn the cascade attempts without ever launching an
+	// executable a host PATH could still expose.
+	let attempts = 0;
+	const restoreExec = armCodegraphExecForTest((async () => {
+		attempts += 1;
+		throw Object.assign(new Error("spawn codegraph ENOENT"), { code: "ENOENT" });
+	}) as unknown as Parameters<typeof armCodegraphExecForTest>[0]);
+	t.after(restoreExec);
 
 	const result = await createCodeGraphTool(undefined, { initLock: lockAcquired }).execute(
 	"test",
@@ -1661,6 +1768,7 @@ test("win32: a genuine miss keeps the cascade: no shim, no scan anchor, unavaila
 	);
 	assert.match(result.content[0].text, /CodeGraph is unavailable/);
 	assert.equal((result.details as { status?: string }).status, "unavailable");
+	assert.ok(attempts >= 1, "the cascade did attempt its spawns; the armed seam launched nothing");
 });
 
 test("POSIX: a bare-codegraph ENOENT stays unavailable — no resolver consultation, no package scan", async (t) => {
@@ -2021,6 +2129,54 @@ test("a failed daemon chain skips the daemon for the rest of the turn", async (t
 	assert.equal(runnerCalls, 3);
 });
 
+test("a startup wedge verdict survives the first prompt boundary until its own expiry", async (t) => {
+	const cwd = workspace(t);
+	const restore = armStartupDaemonSkipForTest(cwd);
+	t.after(restore);
+	let attempts = 0;
+	const tool = createCodeGraphTool(async () => ({ stdout: "cli answer", stderr: "" }), {
+		daemonExplore: async () => {
+			attempts += 1;
+			return { status: "ok", text: "daemon answer" };
+		},
+		rewarm: noRewarm,
+		syncRun: syncNothing,
+	});
+
+	// What before_agent_start fires between the startup detection and the first search: the
+	// startup's verdict is kept, only prompt-scoped failures reset.
+	clearSearchWindow();
+	const result = await tool.execute("test", { operation: "query", query: "symbol" }, undefined, undefined, { cwd } as ExtensionContext);
+
+	assert.deepEqual(result.content, [{ type: "text", text: "cli answer" }]);
+	assert.equal(attempts, 0, "the startup's CLI bypass still spans the first search after the boundary");
+});
+
+test("a startup wedge recorded through a symlink spelling still bypasses the daemon", async (t) => {
+	const root = workspace(t);
+	const holder = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-skip-alias-")));
+	t.after(() => rmSync(holder, { recursive: true, force: true }));
+	const alias = join(holder, "root");
+	symlinkSync(root, alias, "junction");
+	t.after(() => rmSync(alias, { force: true }));
+	const restore = armStartupDaemonSkipForTest(alias);
+	t.after(restore);
+	let attempts = 0;
+	const tool = createCodeGraphTool(async () => ({ stdout: "cli answer", stderr: "" }), {
+		daemonExplore: async () => {
+			attempts += 1;
+			return { status: "ok", text: "daemon answer" };
+		},
+		rewarm: noRewarm,
+		syncRun: syncNothing,
+	});
+
+	const result = await tool.execute("test", { operation: "query", query: "symbol" }, undefined, undefined, { cwd: alias } as ExtensionContext);
+
+	assert.deepEqual(result.content, [{ type: "text", text: "cli answer" }]);
+	assert.equal(attempts, 0, "the verdict is recorded under the same canonical key the query reads");
+});
+
 test("when the daemon and the CLI both fail, the search reports the standard failure", async (t) => {
 	const cwd = workspace(t);
 	const daemonDown: DaemonExplore = async () => ({ status: "unavailable" });
@@ -2249,6 +2405,97 @@ test("POSIX: a warm slower than the attempt budget keeps running while the query
 	await settled();
 });
 
+test("a query retry that warms a daemon announces the same ready line as the lazy re-warm", async (t) => {
+	withoutChildEnv(t);
+	// The session_start wiring owns the ready-notice say handle: a non-project session
+	// start captures it while readiness plans nothing.
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
+	codeGraphTools({
+		registerTool() { /* the registered tool's shape is covered above */ },
+		on(event, handler) { handlers.set(event, handler); },
+	} as unknown as ExtensionAPI);
+	const sessionStart = handlers.get("session_start") as (event: unknown, ctx: unknown) => void;
+	const notices: Array<{ text: string; level: string }> = [];
+	const nonProject = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-notice-")));
+	t.after(() => rmSync(nonProject, { recursive: true, force: true }));
+	armExposureEnsureForTest({ read: () => "{}", write: () => { /* isolated by the fake io */ } });
+	t.after(() => armExposureEnsureForTest(undefined));
+	sessionStart({ reason: "startup" }, {
+		cwd: nonProject,
+		hasUI: true,
+		ui: { notify: (text: string, level: string) => notices.push({ text, level }) },
+	} as unknown as ExtensionContext);
+
+	// A live, answering daemon: the query retry's default warm resolves ok through the
+	// health probe without spawning anything.
+	const cwd = workspace(t);
+	const home = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-warmhome-")));
+	t.after(() => rmSync(home, { recursive: true, force: true }));
+	const registryDir = join(home, ".codegraph", "daemons");
+	mkdirSync(registryDir, { recursive: true });
+	const socketPath = join(home, "daemon.sock");
+	const server = net.createServer((socket) => {
+		socket.on("error", () => {});
+		socket.write(JSON.stringify({ codegraph: "1.6.0", protocol: 1 }) + "\n");
+		let buffer = "";
+		socket.on("data", (chunk: Buffer) => {
+			buffer += chunk.toString("utf8");
+			let newline: number;
+			while ((newline = buffer.indexOf("\n")) >= 0) {
+				const line = buffer.slice(0, newline).trim();
+				buffer = buffer.slice(newline + 1);
+				if (line.length === 0) continue;
+				const message = JSON.parse(line) as { id?: number; method?: string };
+				if (message.method === "initialize") {
+					socket.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "fake", version: "0" } } }) + "\n");
+					continue;
+				}
+				if (message.method === "tools/call") {
+					socket.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "daemon answer" }], isError: false } }) + "\n");
+				}
+			}
+		});
+	});
+	await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
+	t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+	writeFileSync(join(registryDir, "record.json"), JSON.stringify({ root: cwd, socketPath, startedAt: 1, pid: process.pid }));
+	const previousHome = process.env.HOME;
+	const previousProfile = process.env.USERPROFILE;
+	process.env.HOME = home;
+	process.env.USERPROFILE = home;
+	t.after(() => {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousProfile;
+		resetDaemonRegistryMemo();
+	});
+	resetDaemonRegistryMemo();
+
+	withPlatform(t, "linux");
+	const tool = createCodeGraphTool(async () => ({ stdout: "cli answer", stderr: "" }), {
+		daemonExplore: async () => ({ status: "unavailable" as const }),
+		rewarm: noRewarm,
+		syncRun: syncNothing,
+		// warm stays at its default: the adapter under test.
+	});
+
+	const result = await Promise.race([
+		tool.execute("test", { operation: "query", query: "symbol" }, undefined, undefined, { cwd } as ExtensionContext),
+		new Promise<never>((_, reject) => setTimeout(() => reject(new Error("the query never settled")), 20_000)),
+	]);
+
+	assert.match(result.content[0].text, /cli answer/);
+	assert.ok(
+		notices.some((notice) => notice.text === "CodeGraph ready in " + cwd && notice.level === "info"),
+		"the retry warm's success rides the same ready notice as the lazy re-warm",
+	);
+	assert.ok(
+		!notices.some((notice) => /warm-up failed|not answering/.test(notice.text)),
+		"a best-effort query retry never emits failure notices",
+	);
+});
+
 test("init runs the CLI with the workspace, never the daemon, and never triggers a sync", async (t) => {
 	withoutChildEnv(t);
 	const cwd = workspace(t);
@@ -2342,14 +2589,18 @@ test("the default runner reports the real spawned child to the init lease", asyn
 	withoutChildEnv(t);
 	const binDir = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-adopt-bin-")));
 	t.after(() => rmSync(binDir, { recursive: true, force: true }));
-	writeCodeGraphPackage(binDir, "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
+	const entryScript = writeCodeGraphPackage(binDir, "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
 	writePwdGitShim(binDir);
 	const cwd = workspace(t);
 	withWindowsPath(t, binDir);
 	withPlatform(t, "win32");
-	clearCodegraphResolveCache();
-	t.after(() => clearCodegraphResolveCache());
 	const adopted: Array<[number, boolean]> = [];
+	// The pinned entry keeps the real process boundary under test on every host: the resolver
+	// answers process.execPath + the fixture's npm-shim.js, so no CodeGraph installation is
+	// needed and the handcrafted .cmd's rejection cannot skip the spawn.
+	const restoreResolver = armCodegraphEntryResolverForTest(() => ({ status: "entry", entry: { node: process.execPath, script: entryScript } }));
+	t.after(restoreResolver);
+
 	const tool = createCodeGraphTool(undefined, {
 		initLock: async () => ({
 			outcome: "acquired" as const,
@@ -2441,6 +2692,46 @@ test("init rechecks index presence after acquiring a lock another initializer fi
 	assert.equal(releases, 2, "the lock is released however init ends");
 });
 
+
+test("init rechecks the .codegraph identity under the acquired lease, override included", async (t) => {
+	withoutChildEnv(t);
+	const cwd = workspace(t);
+	const ctx = { cwd } as ExtensionContext;
+	const previousOverride = process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	t.after(() => {
+		if (previousOverride === undefined) delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+		else process.env.GENTLE_CODEGRAPH_ALLOW_INDEX = previousOverride;
+	});
+	const outside = join(cwd, "outside-index");
+	mkdirSync(outside);
+	let runnerCalls = 0;
+	let releases = 0;
+	// While this init waits on the lease, .codegraph becomes a link to another checkout's
+	// empty index directory: the database reads absent, but initializing would write through
+	// the link into that other checkout.
+	const initLock = async (): Promise<InitLockOutcome> => {
+		symlinkSync(outside, join(cwd, ".codegraph"));
+		return { outcome: "acquired", release: () => { releases += 1; }, adopt: () => {} };
+	};
+	const tool = createCodeGraphTool(async () => {
+		runnerCalls += 1;
+		return { stdout: "indexed", stderr: "" };
+	}, { initLock });
+
+	const refused = await tool.execute("test", { operation: "init" }, undefined, undefined, ctx);
+	assert.equal(runnerCalls, 0, "the runner never initializes through a replaced .codegraph link");
+	assert.equal(releases, 1, "the acquired lock is released when init stands down");
+	assert.match(refused.content[0].text, /CodeGraph failed to run/);
+	assert.equal((refused.details as { status?: string }).status, "failed");
+
+	rmSync(join(cwd, ".codegraph"), { force: true });
+	process.env.GENTLE_CODEGRAPH_ALLOW_INDEX = "1";
+	const overrideRefused = await tool.execute("test", { operation: "init" }, undefined, undefined, ctx);
+	assert.equal(runnerCalls, 0, "the identity check is independent of the rebuild override");
+	assert.equal(releases, 2, "the override path releases its lock too");
+	assert.match(overrideRefused.content[0].text, /CodeGraph failed to run/);
+});
 
 test("init after an acquired lock runs only for an absent index: unknown stands down unless overridden", async (t) => {
 	// The init refusal under test is the lock-ordered stand-down, not the subagent-child refusal:
@@ -2686,6 +2977,29 @@ test("warmNotice: every warm outcome carries its one notice - the ready line on 
 test("indexStartNotice: init announces initialization in the approved wording; sync keeps its line", () => {
 	assert.deepEqual(indexStartNotice("init"), { text: "initializing the current repo for CodeGraph...", level: "info" });
 	assert.deepEqual(indexStartNotice("sync"), { text: "syncing the CodeGraph index...", level: "info" });
+});
+
+test("indexedNotice: a main-busy stand-down reports deferred initialization, never a created index", () => {
+	assert.deepEqual(indexedNotice({ action: "init", ok: true }, "/repo"), { text: "CodeGraph index created", level: "info" });
+	assert.deepEqual(indexedNotice({ action: "sync", ok: true }, "/repo"), { text: "CodeGraph index synced", level: "info" });
+	assert.deepEqual(indexedNotice({ action: "init", ok: true, stoodDown: true }, "/repo"), {
+		text: "CodeGraph index creation deferred in /repo: the main checkout is creating its index",
+		level: "info",
+	});
+	assert.deepEqual(
+		indexedNotice({ action: "sync", ok: true, stoodDown: true }, "/repo"),
+		{ text: "CodeGraph index synced", level: "info" },
+		"a sync stand-down keeps its synced line: another session's refresh covered the index",
+	);
+	assert.deepEqual(
+		indexedNotice({ action: "init", ok: false, initAttempts: 4 }, "/repo"),
+		{ text: 'codegraph init failed in /repo after 3 retries; run "codegraph init" manually', level: "warning" },
+	);
+	assert.deepEqual(indexedNotice({ action: "init", ok: false }, "/repo"), { text: "codegraph init failed in /repo", level: "warning" });
+	assert.deepEqual(
+		indexedNotice({ action: "sync", ok: false, daemonAlive: true, exitCode: 1 }, "/repo"),
+		codegraphSyncFailureNotice("/repo", "sync", { daemonAlive: true, exitCode: 1 }),
+	);
 });
 
 test("awaitSearchSync: a failing sync beside a live daemon notifies info, a daemon-less one keeps the warning", async (t) => {
@@ -2985,4 +3299,56 @@ test("session_start tells the user to run init manually after the silent retries
 		"one initial run plus three silent retries through the real session-start path",
 	);
 	assert.ok(!existsSync(join(cwd, ".codegraph", "codegraph.db")), "the failing init created no database");
+});
+
+test("session_start reports a main-busy seed stand-down as deferred initialization", { timeout: 20_000 }, async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX fake-bin harness");
+	withoutChildEnv(t);
+	// A linked worktree whose main checkout holds a live init lease: the seed stands down
+	// with main-busy (ok, nothing copied), and the notice must report deferral, not creation.
+	const home = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-busyhome-")));
+	t.after(() => rmSync(home, { recursive: true, force: true }));
+	const previousHome = process.env.HOME;
+	const previousProfile = process.env.USERPROFILE;
+	process.env.HOME = home;
+	process.env.USERPROFILE = home;
+	t.after(() => {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousProfile;
+	});
+	const base = join(home, "repos");
+	mkdirSync(base);
+	const main = join(base, "main");
+	mkdirSync(main);
+	execFileSync("git", ["init", "-b", "main"], { cwd: main, stdio: "ignore" });
+	execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "fixture"], { cwd: main, stdio: "ignore" });
+	const linked = join(base, "linked");
+	execFileSync("git", ["worktree", "add", "-b", "feature", linked], { cwd: main, stdio: "ignore" });
+	writeFileSync(join(linked, "package.json"), "{}\n");
+	// The main checkout's init lease, held live by this process: the fixture token carries
+	// the real host and machine identities so the verdict reads held-live on any host.
+	const now = Date.now();
+	const host = leaseHostIdentity();
+	const machine = leaseMachineIdentity();
+	mkdirSync(join(home, ".codegraph", "locks"), { recursive: true });
+	writeFileSync(lockPathFor(main, "init"), JSON.stringify({
+		kind: "init",
+		pid: process.pid,
+		startedAt: now,
+		expiresAt: now + 600_000,
+		nonce: "main-busy-fixture",
+		...(host === null ? {} : { host }),
+		...(machine === null ? {} : { machine }),
+	}));
+
+	const harness = armSessionStartWiring(t);
+	const { notices, calls } = harness.fire(linked);
+	await untilNotice(notices, /CodeGraph index creation deferred/, 10_000);
+	assert.ok(!notices.some((notice) => notice.text === "CodeGraph index created"), "the stand-down never claims a created index");
+	assert.ok(!notices.some((notice) => /warming up CodeGraph/.test(notice.text)), "a stand-down warms nothing");
+	assert.ok(!calls().includes("init"), "no init runs: the main checkout owns index creation right now");
+	assert.equal(existsSync(join(linked, ".codegraph", "codegraph.db")), false, "the worktree still has no database");
+	await settled();
 });

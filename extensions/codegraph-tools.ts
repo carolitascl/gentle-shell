@@ -1,14 +1,14 @@
 import { execFile, execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveCodegraphShimState, type CodegraphShimResolution } from "../lib/codegraph-cli-resolve.ts";
 import { exploreViaDaemon, MAX_REPLY_CHARS, type DaemonCallResult } from "../lib/codegraph-daemon.ts";
 import { acquireInitLock, type InitLockOutcome } from "../lib/codegraph-lease.ts";
 import { seedWorktreeIndex } from "../lib/codegraph-seed.ts";
-import { CHILD_ENV, firstLineOf, indexState, maybeRewarm, prepareReadiness, runCodegraph, runCodegraphSeedSync, syncBeforeSearch, warmUpDaemon, warmUpDaemonDetailed, WARMUP_TIMEOUT_MS, type SearchSyncInput, type IndexState, type SessionStartReason, type WarmUpOutcome } from "../lib/codegraph-readiness.ts";
+import { CHILD_ENV, firstLineOf, indexState, maybeRewarm, prepareReadiness, runCodegraph, runCodegraphSeedSync, syncBeforeSearch, warmUpDaemon, warmUpDaemonDetailed, WARMUP_TIMEOUT_MS, type SearchSyncInput, type IndexState, type IndexAction, type SessionStartReason, type WarmUpOutcome } from "../lib/codegraph-readiness.ts";
 import { ensureDirectExposureInAgentHomes, type EnsureExposureIo } from "../lib/codegraph-mcp-exposure.ts";
 
 const CODEGRAPH_OPERATION = {
@@ -207,6 +207,20 @@ function tmpForGuard(): string {
 /** Workspaces whose guard already passed this prompt: git is asked once per cwd per prompt. */
 const workspaceVerified = new Set<string>();
 
+/** Whether a validated workspace still carries its repository marker: a Git toplevel always
+ * holds `.git` — a directory, or the file a linked worktree or submodule writes — so a
+ * cached validation survives only while that marker does. An env-driven GIT_DIR repository
+ * without the marker simply re-validates on every call: one extra git run, never a wrong
+ * cache hit. */
+function gitRootMarkerPresent(resolved: string): boolean {
+	try {
+		lstatSync(join(resolved, ".git"));
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function resolveWorkspaceCwd(cwd: string, gitRun: GitRun = defaultGitRun): string {
 	const resolved = realpathSync(cwd);
 	if (!lstatSync(resolved).isDirectory()) {
@@ -215,7 +229,12 @@ function resolveWorkspaceCwd(cwd: string, gitRun: GitRun = defaultGitRun): strin
 	if (resolved === homeForGuard() || resolved === tmpForGuard()) {
 		throw new Error("CodeGraph requires a real Git project root equal to the current workspace, not HOME or a temporary directory.");
 	}
-	if (workspaceVerified.has(resolved)) return resolved;
+	if (workspaceVerified.has(resolved)) {
+		// The cache holds only while the repository identity does: a checkout that lost its
+		// .git mid-prompt re-runs the full root check instead of dispatching into a non-repository.
+		if (gitRootMarkerPresent(resolved)) return resolved;
+		workspaceVerified.delete(resolved);
+	}
 	try {
 		const root = realpathSync(gitRun(["rev-parse", "--show-toplevel"], resolved));
 		if (!isSameDirectory(root, resolved)) {
@@ -337,14 +356,16 @@ function shellWords(command: string): { words: string[]; unterminated: boolean }
  * first non-flag word can be it. The word is read whole — quotes and escapes keep a path with
  * spaces one argument — and a positional left unterminated by an unclosed quote or backslash
  * is a form this parser cannot place: it falls back to the caller's cwd, keeping the command
- * judged here rather than silently allowed. */
-function rebuildTargetDir(rest: string, cwd: string): string {
+ * judged here rather than silently allowed. A caller's cwd this walk could not determine leaves a relative positional equally unplaceable; only an absolute one still pins a target. */
+function rebuildTargetDir(rest: string, cwd: string | undefined): string | undefined {
 	const { words, unterminated } = shellWords(rest);
 	for (let index = 2; index < words.length; index += 1) {
 		const word = words[index];
 		if (word.startsWith("-")) continue;
 		if (unterminated && index === words.length - 1) return cwd;
-		return resolve(cwd, word);
+		// An absolute positional names its target whatever directory the command runs in; a
+		// relative one is placed by that directory, and no directory leaves it unplaceable.
+		return isAbsolute(word) ? word : cwd === undefined ? undefined : resolve(cwd, word);
 	}
 	return cwd;
 }
@@ -353,9 +374,12 @@ function rebuildTargetDir(rest: string, cwd: string): string {
  * the CLI itself locates it: `init [path]` resolves its positional (or the caller's cwd)
  * exactly and never an ancestor — an unindexed directory is a legitimate first init — while
  * `index` rebuilds the exact target when it is initialized and otherwise the nearest
- * initialized ancestor, the resolution a bare `codegraph index` performs from the cwd. */
-function rebuildsExistingIndex(verb: "index" | "init", rest: string, cwd: string): boolean {
+ * initialized ancestor, the resolution a bare `codegraph index` performs from the cwd. A rebuild whose working directory this walk could not determine counts as a rebuild: the original directory is never proof the target is unindexed. */
+function rebuildsExistingIndex(verb: "index" | "init", rest: string, cwd: string | undefined): boolean {
+	// A target this walk cannot place is never proof that nothing existing is rebuilt: the
+	// unknown directory the command runs in may hold the index the rebuild would kill.
 	const target = rebuildTargetDir(rest, cwd);
+	if (target === undefined) return true;
 	if (indexExists(target)) return true;
 	if (verb === "init") return false;
 	for (let current = dirname(target);; current = dirname(current)) {
@@ -420,8 +444,10 @@ function unquoteAssignment(token: string): string {
 }
 
 /** A # begins a comment only at the start of a word: after start-of-input or any shell
- * metacharacter that ends a word. Mid-word (`echo a#b`) it is a literal character, exactly
- * as Bash reads it. */
+ * metacharacter that ends a word. Mid-word (`echo a#b`, or right after an escaped space —
+ * `cat foo\ #note` keeps the # inside the word) it is a literal character, exactly as Bash
+ * reads it. The passes below track the word start through their scan instead of testing the
+ * previous raw character, which cannot tell an escaped space from one that ends a word. */
 const COMMENT_WORD_BOUNDARY = /[\s;&|()<>]/;
 
 /**
@@ -438,6 +464,10 @@ const COMMENT_WORD_BOUNDARY = /[\s;&|()<>]/;
 function stripHeredocBodies(command: string): string {
 	let out = "";
 	let index = 0;
+	// Whether the next character starts a shell word — the state a comment's # needs,
+	// tracked through the scan instead of re-derived from the previous raw character: an
+	// escaped space (`cat foo\ #note`) does not end the word, so a # after it is a literal.
+	let wordStart = true;
 	while (index < command.length) {
 		const char = command[index];
 		if (char === "'" || char === '"') {
@@ -445,25 +475,31 @@ function stripHeredocBodies(command: string): string {
 			const end = close === -1 ? command.length : close + 1;
 			out += command.slice(index, end);
 			index = end;
+			wordStart = false;
 			continue;
 		}
 		if (char === "\\") {
 			out += command.slice(index, Math.min(index + 2, command.length));
 			index += 2;
+			// The escaped character is word content; a backslash-newline continuation is
+			// transparent instead — the word (or the empty input before it) keeps its state.
+			if (command[index - 1] !== "\n") wordStart = false;
 			continue;
 		}
-		if (char === "#" && (index === 0 || COMMENT_WORD_BOUNDARY.test(command[index - 1]))) {
+		if (char === "#" && wordStart) {
 			// A word-initial # comments out the rest of the line: its quotes and operators are
 			// comment text, so the line is copied whole and scanning resumes on the next line.
 			const lineEnd = command.indexOf("\n", index);
 			const end = lineEnd === -1 ? command.length : lineEnd + 1;
 			out += command.slice(index, end);
 			index = end;
+			wordStart = true;
 			continue;
 		}
 		if (char === "<" && command[index + 1] === "<" && command[index + 2] === "<") {
 			out += "<<<";
 			index += 3;
+			wordStart = true;
 			continue;
 		}
 		if (char === "<" && command[index + 1] === "<") {
@@ -478,6 +514,7 @@ function stripHeredocBodies(command: string): string {
 				// `<<` with no delimiter word: a syntax error, copied as plain content.
 				out += "<<";
 				index += 2;
+				wordStart = true;
 				continue;
 			}
 			out += command.slice(index, lineEnd + 1);
@@ -485,10 +522,12 @@ function stripHeredocBodies(command: string): string {
 			for (const delimiter of delimiters) {
 				index = endOfHeredocBody(command, index, delimiter);
 			}
+			wordStart = true;
 			continue;
 		}
 		out += char;
 		index += 1;
+		wordStart = COMMENT_WORD_BOUNDARY.test(char);
 	}
 	return out;
 }
@@ -509,20 +548,26 @@ interface HeredocDelimiter {
 function heredocDelimitersOnLine(command: string, from: number, lineEnd: number): HeredocDelimiter[] {
 	const delimiters: HeredocDelimiter[] = [];
 	let index = from;
+	// The same word-start state the outer passes track: a # after an escaped space is a
+	// literal inside the word, not the comment that would end the delimiter scan.
+	let wordStart = true;
 	while (index < lineEnd) {
 		const char = command[index];
-		if (char === "#" && COMMENT_WORD_BOUNDARY.test(command[index - 1])) return delimiters;
+		if (char === "#" && wordStart) return delimiters;
 		if (char === "'" || char === '"') {
 			const close = command.indexOf(char, index + 1);
 			index = close === -1 ? lineEnd : Math.min(close + 1, lineEnd);
+			wordStart = false;
 			continue;
 		}
 		if (char === "\\") {
+			if (command[index + 1] !== "\n") wordStart = false;
 			index += 2;
 			continue;
 		}
 		if (char === "<" && command[index + 1] === "<" && command[index + 2] === "<") {
 			index += 3;
+			wordStart = true;
 			continue;
 		}
 		if (char === "<" && command[index + 1] === "<") {
@@ -550,9 +595,11 @@ function heredocDelimitersOnLine(command: string, from: number, lineEnd: number)
 			}
 			delimiters.push({ word, stripTabs });
 			index = cursor;
+			wordStart = false;
 			continue;
 		}
 		index += 1;
+		wordStart = COMMENT_WORD_BOUNDARY.test(char);
 	}
 	return delimiters;
 }
@@ -590,6 +637,9 @@ function shellCommandList(command: string): string[] {
 	let quote: "'" | '"' | undefined;
 	let escaped = false;
 	let comment = false;
+	// The word-start state the comment boundary needs, tracked instead of re-derived from
+	// the last raw character: an escaped space keeps the word open, so a # after it is literal.
+	let wordStart = true;
 	for (const char of stripHeredocBodies(command)) {
 		// Comment text: a word-initial # runs to the end of the line, and only the newline
 		// that ends it still separates commands.
@@ -607,6 +657,7 @@ function shellCommandList(command: string): string[] {
 			if (char !== "\n") {
 				current += "\\";
 				current += char;
+				wordStart = false;
 			}
 			escaped = false;
 			continue;
@@ -623,11 +674,12 @@ function shellCommandList(command: string): string[] {
 		if (char === '"' || char === "'") {
 			quote = char;
 			current += char;
+			wordStart = false;
 			continue;
 		}
 		// A word-initial # comments out the rest of the line: quotes and separators inside
 		// the comment are text, and the comment's own newline still ends the command.
-		if (char === "#" && (current.length === 0 || COMMENT_WORD_BOUNDARY.test(current.slice(-1)))) {
+		if (char === "#" && wordStart) {
 			comment = true;
 			current += char;
 			continue;
@@ -635,9 +687,11 @@ function shellCommandList(command: string): string[] {
 		if (char === "\n" || char === ";" || char === "&" || char === "|") {
 			commands.push(current);
 			current = "";
+			wordStart = true;
 			continue;
 		}
 		current += char;
+		wordStart = COMMENT_WORD_BOUNDARY.test(char);
 	}
 	commands.push(current);
 	return commands.filter((part) => part.trim().length > 0);
@@ -650,17 +704,57 @@ function shellCommandList(command: string): string[] {
  * on an unrelated earlier command) and its verb, on which the CLI's own target rules key.
  * Every executable command is inspected, not only the first: `cd . && codegraph index .`
  * rebuilds as surely as a bare `codegraph index .`. The word boundary keeps every other
- * subcommand (`codegraph indexer`, `sync`, `query`, `unlock`, `status`) out.
+ * subcommand (`codegraph indexer`, `sync`, `query`, `unlock`, `status`) out. Each rebuild also carries the working directory its position in the list runs in: every `cd` the list can follow moves it, and any form that can move it unseen leaves it undefined.
  */
-function codegraphIndexCommands(command: string): { rest: string; verb: "index" | "init"; allowIndexOverride: boolean }[] {
+/** The directory after one `cd` command a flat list can follow: exactly one literal
+ * argument — quote removal applied, no variable, tilde, or substitution, no extra words
+ * the shell refuses — moves the tracked directory exactly as the shell resolves it (an
+ * absolute path resets it, a relative one composes onto it); every other form, a bare
+ * `cd` to HOME, `cd -`, or a substituted target, leaves a directory this walk cannot name. */
+function cdTargetDir(rest: string, cwd: string | undefined): string | undefined {
+	const { words } = shellWords(rest.slice(2).trim());
+	if (words.length !== 1) return undefined;
+	const word = words[0] ?? "";
+	if (/[$~(`]/.test(word)) return undefined;
+	if (isAbsolute(word)) return word;
+	return cwd === undefined ? undefined : resolve(cwd, word);
+}
+
+/** One rebuild command of a shell list, with the working-directory state at its position. */
+interface RebuildCommand {
+	rest: string;
+	verb: "index" | "init";
+	allowIndexOverride: boolean;
+	/** The directory the command runs in: the caller's cwd moved by every `cd` the list can
+	 * follow, or undefined when a form this walk cannot follow may have moved it. */
+	cwd: string | undefined;
+}
+
+/** Commands that can move the working directory outside a literal `cd`: a leading
+ * subshell or substitution runs directory changes of its own, and eval, sourcing, the
+ * builtin and command wrappers, and the directory stack all move it in forms this walk
+ * cannot read. */
+const UNTRACKABLE_CWD_COMMAND = /^[$`]|^\(|^(?:eval|source|builtin|command|pushd|popd)\b|^\.\s/;
+
+function codegraphIndexCommands(command: string, startCwd: string): RebuildCommand[] {
 	const rebuild = /^codegraph\s+(index|init)\b/;
-	return shellCommandList(command)
-		.map((part) => {
-			const parsed = leadingAssignments(part);
-			const verb = rebuild.exec(parsed.rest);
-			return verb === null ? undefined : { rest: parsed.rest, verb: verb[1] as "index" | "init", allowIndexOverride: parsed.allowIndexOverride };
-		})
-		.filter((parsed): parsed is { rest: string; verb: "index" | "init"; allowIndexOverride: boolean } => parsed !== undefined);
+	const rebuilds: RebuildCommand[] = [];
+	let cwd: string | undefined = startCwd;
+	for (const part of shellCommandList(command)) {
+		const parsed = leadingAssignments(part);
+		if (parsed.rest === "cd" || parsed.rest.startsWith("cd ") || parsed.rest.startsWith("cd\t")) {
+			cwd = cdTargetDir(parsed.rest, cwd);
+			continue;
+		}
+		// A command that can move the directory in a form this walk cannot follow makes
+		// every later command's directory unknowable.
+		if (UNTRACKABLE_CWD_COMMAND.test(parsed.rest)) cwd = undefined;
+		const verb = rebuild.exec(parsed.rest);
+		if (verb !== null) {
+			rebuilds.push({ rest: parsed.rest, verb: verb[1] as "index" | "init", allowIndexOverride: parsed.allowIndexOverride, cwd });
+		}
+	}
+	return rebuilds;
 }
 
 // CodeGraph writes .codegraph/.gitignore with `*` and `!.gitignore`, so that file
@@ -991,6 +1085,44 @@ const daemonSkipUntil = new Map<string, number>();
 /** How long a wedged daemon is bypassed after its post-warm attempt times out. */
 const DAEMON_SKIP_MS = 60_000;
 
+/** The bypass entries a session START recorded from its own health verdict: unlike the
+ * prompt-scoped failures the query path records, these survive the first
+ * before_agent_start — the user was told queries use the CLI fallback — and expire on
+ * their own DAEMON_SKIP_MS clock. */
+const startupDaemonSkip = new Set<string>();
+
+/** The map key a daemon bypass is recorded and read under: the same canonical spelling
+ * resolveWorkspaceCwd produces, so a session started through a symlink to the project
+ * still finds its recorded verdict at query time; an unresolvable workspace keeps its own
+ * spelling. */
+function daemonSkipKey(workspace: string): string {
+	try {
+		return resolveWorkspaceCwd(workspace);
+	} catch {
+		return workspace;
+	}
+}
+
+/** Records a wedged daemon the session start itself detected: keyed canonically and
+ * marked startup-owned so the first prompt boundary keeps it until its own expiry. */
+function recordStartupDaemonSkip(workspace: string): void {
+	const key = daemonSkipKey(workspace);
+	daemonSkipUntil.set(key, Date.now() + DAEMON_SKIP_MS);
+	startupDaemonSkip.add(key);
+}
+
+/** Test seam for the startup wedge verdict: records the entry the session-start warm
+ * seam records and returns its restore. Exercised only by the test suite; not part of
+ * the tool's runtime surface. */
+export function armStartupDaemonSkipForTest(workspace: string): () => void {
+	const key = daemonSkipKey(workspace);
+	recordStartupDaemonSkip(workspace);
+	return () => {
+		daemonSkipUntil.delete(key);
+		startupDaemonSkip.delete(key);
+	};
+}
+
 /** The session-start say handle the lazy re-warm ready notice rides: captured when a session
  * starts so a daemon revived mid-session can announce itself, replaced by every newer session,
  * and undefined whenever no session through this module ever started - no UI, no announce. */
@@ -1023,7 +1155,15 @@ export function clearSearchWindow(): void {
 	workspaceVerified.clear();
 	excludeApplied.clear();
 	excludePresent.clear();
-	daemonSkipUntil.clear();
+	// A new prompt resets only the prompt-scoped query failures: a wedge the session START
+	// detected keeps its bypass until the verdict's own 60-second expiry, so the first
+	// search still honors the "queries use the CLI fallback for now" the user was told.
+	const now = Date.now();
+	for (const [cwd, until] of daemonSkipUntil) {
+		if (startupDaemonSkip.has(cwd) && until > now) continue;
+		daemonSkipUntil.delete(cwd);
+		startupDaemonSkip.delete(cwd);
+	}
 }
 
 /** What a failed sync knows about its own cause when the runner reported it. */
@@ -1073,6 +1213,33 @@ export function warmNotice(outcome: WarmUpOutcome, cwd: string): { text: string;
 export function indexStartNotice(action: "init" | "sync"): { text: string; level: "info" } {
 	if (action === "sync") return { text: "syncing the CodeGraph index...", level: "info" };
 	return { text: "initializing the current repo for CodeGraph...", level: "info" };
+}
+
+/**
+ * The notice for one settled session-start index action: a stand-down init — the main
+ * checkout is creating its own index, so this worktree still has no database — reports
+ * deferral instead of creation, while sync keeps its synced line and an init that produced
+ * or confirmed an index keeps the creation line. Failure notices map exactly as the
+ * wiring emitted them before the mapping moved here.
+ */
+export function indexedNotice(
+	result: { action: IndexAction; ok: boolean; stoodDown?: boolean; daemonAlive?: boolean; exitCode?: number | null; stderrTail?: string; initAttempts?: number },
+	cwd: string,
+): { text: string; level: "info" | "warning" } | undefined {
+	// "none" is reported before anything runs and carries no notice of its own.
+	if (result.action === "none") return undefined;
+	if (result.ok) {
+		if (result.action === "sync") return { text: "CodeGraph index synced", level: "info" };
+		if (result.stoodDown) return { text: `CodeGraph index creation deferred in ${cwd}: the main checkout is creating its index`, level: "info" };
+		return { text: "CodeGraph index created", level: "info" };
+	}
+	if (result.action === "sync") return codegraphSyncFailureNotice(cwd, "sync", result);
+	// An init whose silent retries were exhausted is the one failure the user can fix by
+	// hand, so the notice names the action; every other init failure keeps the plain line.
+	if (result.initAttempts !== undefined && result.initAttempts > 1) {
+		return { text: `codegraph init failed in ${cwd} after ${result.initAttempts - 1} retries; run "codegraph init" manually`, level: "warning" };
+	}
+	return { text: `codegraph ${result.action} failed in ${cwd}`, level: "warning" };
 }
 
 /** How long a session-start index notice waits before it is said. The installed pi TUI paints
@@ -1164,7 +1331,15 @@ export function createCodeGraphTool(
 		daemonExplore = queryViaDaemon,
 		// The win32 query path never awaits its warm-up (S9), so there it runs backgrounded — an
 		// unref'ed warm-up cannot keep the session alive; POSIX races its wait, never blocking past it.
-		warm = (project: string, timeoutMs: number) => warmUpDaemon(project, true, timeoutMs),
+		// A warm this path started announces its success through the same ready line the lazy
+		// re-warm emits — the session-owned say handle — while failures stay silent: the
+		// query path is best effort and already falls back to the CLI.
+		warm = (project: string, timeoutMs: number) => warmUpDaemon(project, true, timeoutMs).then((warmed) => {
+			if (!warmed) return false;
+			const notice = warmNotice({ ok: true }, project);
+			warmNoticeSay?.(notice.text, notice.level);
+			return true;
+		}),
 		// The lazy re-warm announces only success: a daemon that stays dead is re-warmed by every
 		// query, and failure notices there would be per-query noise the CLI fallback already
 		// answers - one ready line when the daemon is back is the whole message.
@@ -1305,6 +1480,8 @@ export function createCodeGraphTool(
 						// e.g. no project loaded): the CLI answers until the next turn instead of re-paying
 						// attempt+warm+attempt on every query.
 						daemonSkipUntil.set(cwd, Date.now() + DAEMON_SKIP_MS);
+						// Fresh query evidence supersedes a startup verdict: this entry is prompt-scoped.
+						startupDaemonSkip.delete(cwd);
 					}
 				}
 				if (viaDaemon?.status === "ok") return finish(truncateOutput(viaDaemon.text), { viaDaemon: true, syncTriggered });
@@ -1369,6 +1546,11 @@ export function createCodeGraphTool(
 				return fail(new Error(reason), { reason });
 			}
 			try {
+				// Re-checked under the acquired lease: `.codegraph` may have become a link to
+				// another checkout's index while this init waited — the same identity check the
+				// entry ran, independent of the override, which authorizes rebuilding THIS
+				// target, never an initialization redirected through a link.
+				assertSafeIndexDirectory(cwd);
 				// Re-checked under the acquired lock: the other initializer may have finished AND
 				// released while this call waited, so acquisition succeeds with the database already
 				// in place — the free-lease branch is not a completion proof. Rebuilding here would
@@ -1448,7 +1630,7 @@ export default function codeGraphTools(pi: ExtensionAPI): void {
 			if (event.toolName !== "bash" && event.toolName !== "bash_background") return undefined;
 			const command = (event.input as { command?: unknown }).command;
 			if (typeof command !== "string") return undefined;
-			const rebuilds = codegraphIndexCommands(command);
+			const rebuilds = codegraphIndexCommands(command, ctx.cwd);
 			if (rebuilds.length === 0) return undefined;
 			if (process.env.GENTLE_CODEGRAPH_ALLOW_INDEX === "1") return undefined;
 			// The override must ride EVERY rebuild command: one authorized rebuild never
@@ -1460,7 +1642,7 @@ export default function codeGraphTools(pi: ExtensionAPI): void {
 			// `index` the nearest initialized ancestor above it, the resolution a bare call performs.
 			// A rebuild carrying its own override is already authorized: it is excluded here, so an
 			// ordinary first init elsewhere in the list never blocks on the authorized sibling's target.
-			if (!rebuilds.some((rebuild) => !rebuild.allowIndexOverride && rebuildsExistingIndex(rebuild.verb, rebuild.rest, ctx.cwd))) return undefined;
+			if (!rebuilds.some((rebuild) => !rebuild.allowIndexOverride && rebuildsExistingIndex(rebuild.verb, rebuild.rest, rebuild.cwd))) return undefined;
 			return { block: true, reason: CODEGRAPH_INDEX_BLOCK_REASON };
 		} catch {
 			return undefined;
@@ -1481,13 +1663,20 @@ export default function codeGraphTools(pi: ExtensionAPI): void {
 		};
 		// The latest session owns the lazy re-warm's ready notice.
 		warmNoticeSay = say;
+		// The seed outcome the index notice keys on: main-busy is the benign stand-down whose
+		// ok verdict must not read as a created index (the worktree still has no database).
+		let seedStoodDown = false;
 		void prepareReadiness({
 			cwd: ctx.cwd,
 			env: process.env,
 			reason: reason as SessionStartReason,
 			isProjectRoot: isWorkspaceProjectRoot,
 			run: runCodegraph,
-			seed: (workspace) => seedWorktreeIndex({ cwd: workspace, run: runCodegraphSeedSync }),
+			seed: async (workspace) => {
+				const seeded = await seedWorktreeIndex({ cwd: workspace, run: runCodegraphSeedSync });
+				if (seeded.outcome === "main-busy") seedStoodDown = true;
+				return seeded;
+			},
 			// The seam is the ready event source: every warm outcome the session can see — freshly
 			// warmed, adopted winner, probe-verified live daemon, wedged, failed — is announced here
 			// exactly once, on the same hasUI-gated channel.
@@ -1497,7 +1686,7 @@ export default function codeGraphTools(pi: ExtensionAPI): void {
 				say(notice.text, notice.level);
 				// A wedged daemon holds the lock and cannot serve, and a respawn would lose the lock to
 				// the wedged holder — the CLI answers queries until the bypass expires.
-				if (outcome.wedged) daemonSkipUntil.set(workspace, Date.now() + DAEMON_SKIP_MS);
+				if (outcome.wedged) recordStartupDaemonSkip(workspace);
 				return outcome.ok;
 			},
 			onStart: (action) => {
@@ -1515,23 +1704,8 @@ export default function codeGraphTools(pi: ExtensionAPI): void {
 				timer.unref?.();
 			},
 			onIndexed: (result) => {
-				if (result.ok) {
-					say(result.action === "sync" ? "CodeGraph index synced" : "CodeGraph index created", "info");
-					return;
-				}
-				if (result.action === "sync") {
-					const notice = codegraphSyncFailureNotice(ctx.cwd, "sync", result);
-					say(notice.text, notice.level);
-					return;
-				}
-				// An init whose silent retries were exhausted is the one failure the user can fix
-				// by hand, so the notice names the action. Every other init failure (a lock held
-				// elsewhere, a seed outcome) keeps the plain line: no retries ran to count.
-				if (result.initAttempts !== undefined && result.initAttempts > 1) {
-					say(`codegraph init failed in ${ctx.cwd} after ${result.initAttempts - 1} retries; run "codegraph init" manually`, "warning");
-					return;
-				}
-				say(`codegraph ${result.action} failed in ${ctx.cwd}`, "warning");
+				const notice = indexedNotice({ ...result, stoodDown: seedStoodDown }, ctx.cwd);
+				if (notice) say(notice.text, notice.level);
 			},
 			onWarmStart: () => say("warming up CodeGraph...", "info"),
 		})
