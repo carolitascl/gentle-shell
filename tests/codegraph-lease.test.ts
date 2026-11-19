@@ -347,6 +347,36 @@ test("a token from another host or PID namespace is never judged dead locally: u
 	}
 });
 
+test("an expired identity-less token with dead holder and writer pids is reclaimable stale, not an unknown wedge", (t) => {
+	const dir = locksDir(t);
+	const path = join(dir, "token.json");
+	const now = Date.now();
+	const dead = deadPid();
+
+	// The orphan shape diagnosed on 2026-11-19: an init token whose session and spawned init
+	// child both died, written by a launcher that recorded no host identity, long past its
+	// TTL. Every later session start fail-closed on it forever: the token nobody alive owns.
+	writeToken(path, { kind: "init", pid: dead, startedAt: now - 600_000, expiresAt: now - 1, nonce: "orphan", writerPid: dead, writerProxy: false, writerPidAt: now - 600_000 });
+	assert.equal(readLeaseVerdict(path, now), "held-stale", "the orphaned token is stale by the TTL displacement contract");
+	const lease = tryAcquireLease(path, "init", 600_000, now);
+	assert.ok(lease, "the wedge a dead session leaves behind is recovered, not fail-closed forever");
+	lease.release();
+
+	// The live-writer check stays strictly ahead of expiry: a live adopted writer holds
+	// whatever the token shape says, expired or not, provenance or not.
+	writeToken(path, { kind: "init", pid: dead, startedAt: now - 600_000, expiresAt: now - 1, nonce: "orphan", writerPid: process.pid, writerProxy: false, writerPidAt: now - 600_000 });
+	assert.equal(readLeaseVerdict(path, now), "held-live", "a live writer is never raced, whatever the token shape");
+	assert.equal(tryAcquireLease(path, "init", 600_000, now), undefined);
+
+	// Provenance still decides everywhere else: the same dead pids with a foreign host keep
+	// the fail-closed unknown - this host cannot judge another host's pids at all.
+	const foreign = "linux:01234567-89ab-cdef-0123-456789abcdef:pid:[1]";
+	writeToken(path, { kind: "init", pid: dead, startedAt: now - 600_000, expiresAt: now - 1, nonce: "orphan", host: foreign, writerPid: dead, writerProxy: false, writerPidAt: now - 600_000 });
+	assert.equal(readLeaseVerdict(path, now), "unknown", "a foreign host token is never stolen from this host");
+	assert.equal(tryAcquireLease(path, "init", 600_000, now), undefined);
+});
+
+
 test("an earlier-boot token of this machine is reclaimable stale once expired: the reboot wedge is bounded", (t) => {
 	const host = localHostIdentity();
 	const machine = localMachineIdentity();

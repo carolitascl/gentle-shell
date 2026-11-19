@@ -147,7 +147,9 @@ function deriveMachineIdentity(): string | null {
  * token back to held-live, because a live writer is never unlocked under. Expiry is the hard
  * displacement bound: an expired token is reclaimed even while its local holder's pid still lives
  * (a wedged holder must not keep the lease forever); the displaced holder's own state changes stay
- * nonce-fenced in release() and adopt(). A token from an earlier boot of this machine (its
+ * nonce-fenced in release() and adopt(). An expired identity-less token whose holder and writer
+ * pids are dead here is reclaimed the same way: the TTL bounds every host's writer, so the
+ * wedge a dead session leaves behind never outlives its TTL. A token from an earlier boot of this machine (its
  * machine-stable identity matches, its boot-scoped identity does not) has no pid left to probe —
  * they died with that boot — so it expires into reclaimable stale instead of an unknown wedge;
  * a different machine, or a legacy token without the machine part, keeps the fail-closed unknown.
@@ -213,7 +215,21 @@ export function readLeaseVerdict(path: string, now: number = Date.now(), cwd?: s
 	// liveness without ever granting a dead verdict it cannot prove.
 	const host = leaseHostIdentity();
 	const provablyLocal = token.host !== undefined ? token.host === host : host === null;
-	if (token.expiresAt <= now) return provablyLocal ? "held-stale" : "unknown";
+	if (token.expiresAt <= now) {
+		if (provablyLocal) return "held-stale";
+		// The orphan a session that died mid-init leaves behind on a host that derives identity:
+		// an identity-less token, long past its TTL, with a locally-dead holder — the live-writer
+		// check above already established its writer is not running here. The TTL is the hard
+		// displacement bound for every host's writer (sized to outlive the longest command plus
+		// its kill waits, and it already displaces even a live provably-local holder), so past
+		// it no host's writer may still legitimately hold: reclaiming here is the lease's own
+		// contract, not a race on a live writer. Without this reclaim, the token nobody alive
+		// owns verdicts unknown forever and every later session start fail-closes past it —
+		// and this branch stays strictly narrower than the provably-local one, which reclaims
+		// an expired token without asking for a dead pid at all.
+		if (token.host === undefined && !processAlive(token.pid)) return "held-stale";
+		return "unknown";
+	}
 	if (!provablyLocal) return processAlive(token.pid) ? "held-live" : "unknown";
 	return processAlive(token.pid) ? "held-live" : "held-stale";
 }
