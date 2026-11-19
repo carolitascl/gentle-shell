@@ -128,6 +128,12 @@ function connectProbe(pipePath: string, timeoutMs: number): PipeProbeOutcome {
 	const state = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 	try {
 		const worker = new Worker(PROBE_WORKER_SOURCE, { eval: true, workerData: { pipePath, timeoutMs, state } });
+		// An asynchronous worker failure — a thread that never starts, a worker-side throw — arrives
+		// as an 'error' event rather than a throw from the constructor, and an unhandled one takes the
+		// whole host down. A worker that never reports is already an inconclusive probe, so the
+		// listener only keeps the event from escaping; the shared cell keeps answering for the
+		// workers that complete normally.
+		worker.on("error", () => {});
 		Atomics.wait(state, 0, 0, Math.max(1, timeoutMs));
 		void worker.terminate();
 	} catch {
@@ -152,13 +158,18 @@ export function setPipeProbeForTests(probe: PipeProbe | undefined): void {
  * of the daemon's own pipe replaces enumerating every named pipe on the machine, and a probe that
  * connected is remembered for a short window. A clean refusal — the pipe is not there — is the one
  * answer that counts as absent; every other failure still counts as present rather than risk
- * missing a live daemon, the same fail-safe the pipe listing had.
+ * missing a live daemon, the same fail-safe the pipe listing had. A caller with a deadline — a
+ * query budget that discovery also spends — bounds each probe to the leftover and skips probing
+ * once it is spent.
  */
-export function socketPresent(socketPath: string, platform: NodeJS.Platform = process.platform): boolean {
+export function socketPresent(socketPath: string, platform: NodeJS.Platform = process.platform, deadlineAt?: number): boolean {
 	if (platform !== "win32" || !socketPath.toLowerCase().startsWith(PIPE_PREFIX)) return existsSync(socketPath);
 	const probedAt = pipeProbeMemo.get(socketPath);
 	if (probedAt !== undefined && Date.now() - probedAt < PIPE_PROBE_MEMO_MS) return true;
-	const outcome = pipeProbe(socketPath, PIPE_PROBE_TIMEOUT_MS);
+	// The skipped or shrunken probe never turns into a false absence: inconclusive still counts as
+	// present, and only a clean refusal is remembered as proof of anything.
+	const budget = deadlineAt === undefined ? PIPE_PROBE_TIMEOUT_MS : Math.min(PIPE_PROBE_TIMEOUT_MS, deadlineAt - Date.now());
+	const outcome: PipeProbeOutcome = budget <= 0 ? "inconclusive" : pipeProbe(socketPath, budget);
 	if (outcome === "open") pipeProbeMemo.set(socketPath, Date.now());
 	return outcome !== "refused";
 }
@@ -171,9 +182,10 @@ export interface DaemonInfo {
 	root?: string;
 }
 
-/** The project's daemons that are still there — pid alive, socket present — newest first. */
-export function liveDaemons(cwd: string, registryDir?: string, platform: NodeJS.Platform = process.platform): RegisteredDaemon[] {
-	return registeredDaemons(cwd, registryDir, platform).filter((entry) => entry.pid !== undefined && processAlive(entry.pid) && socketPresent(entry.socketPath, platform));
+/** The project's daemons that are still there — pid alive, socket present — newest first. An
+ * optional deadline bounds the pipe probes the presence check may spend. */
+export function liveDaemons(cwd: string, registryDir?: string, platform: NodeJS.Platform = process.platform, deadlineAt?: number): RegisteredDaemon[] {
+	return registeredDaemons(cwd, registryDir, platform).filter((entry) => entry.pid !== undefined && processAlive(entry.pid) && socketPresent(entry.socketPath, platform, deadlineAt));
 }
 
 /** The project's newest daemon from CodeGraph's own registry. Reads only; starts nothing. */
@@ -188,9 +200,9 @@ export function projectSpelling(daemon: DaemonInfo | undefined, cwd: string): st
 	return daemon?.root ?? realpathSync(cwd);
 }
 
-/** Sockets of the project's live daemons, newest first. */
-function daemonSockets(cwd: string, registryDir?: string): string[] {
-	return liveDaemons(cwd, registryDir).map((entry) => entry.socketPath);
+/** Sockets of the project's live daemons, newest first; an optional deadline bounds the discovery probes. */
+function daemonSockets(cwd: string, registryDir?: string, deadlineAt?: number): string[] {
+	return liveDaemons(cwd, registryDir, undefined, deadlineAt).map((entry) => entry.socketPath);
 }
 
 export type DaemonCallResult =
@@ -271,10 +283,10 @@ export function mcpReplyKind(message: McpReply): McpReplyKind | undefined {
  * from a child's stdout, decoded strings from a socket), splits and trims lines, skips the empty ones, and
  * hands each parsed reply to `onReply` — undefined marks a line `parseMcpReply` rejects; each conversation
  * decides what that means. A truthy return from `onReply` stops the scan for the rest of the chunk, the
- * data handler's `return`. The chunk handler itself answers true when one frame — a complete line
- * or the unfinished remainder — grew past `maxBufferChars`, the runaway guard the socket
- * conversation finishes on; a frame just under the cap keeps its reply even when blank lines pad
- * out the chunk that carried it.
+ * data handler's `return`. The chunk handler itself answers true when one frame grew past
+ * `maxBufferChars` — a complete line past it in trimmed content, the unfinished remainder past it
+ * in raw size — the runaway guard the socket conversation finishes on; a frame just under the cap
+ * keeps its reply even when blank lines pad out the chunk that carried it.
  */
 export function mcpLineReader(onReply: (message: McpReply | undefined) => boolean | void, maxBufferChars: number = Number.POSITIVE_INFINITY): (chunk: string | Buffer) => boolean {
 	let buffer = "";
@@ -284,11 +296,12 @@ export function mcpLineReader(onReply: (message: McpReply | undefined) => boolea
 	const decoder = new StringDecoder("utf8");
 	return (chunk: string | Buffer) => {
 		buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
-		// The cap measures each frame on its own, on trimmed content on both paths: a complete
-		// reply just under it is read even when its chunk carries trailing blank lines, and the
-		// unfinished remainder takes the same trimmed measure, so trailing whitespace before a
-		// late newline never counts as frame content; one oversized frame, complete or partial,
-		// is the runaway the guard answers true for.
+		// The cap measures each frame on its own, and each side of the newline takes the measure that
+		// bounds its own cost: a complete reply is measured on trimmed content — one just under the
+		// cap is read even when its chunk carries trailing blank lines — while the unfinished
+		// remainder is measured on its raw size, because the buffer itself is the memory the cap
+		// guards: whitespace with no newline to trim it against cannot grow it past the limit. One
+		// oversized frame, complete or partial, is the runaway the guard answers true for.
 		let newline: number;
 		while ((newline = buffer.indexOf("\n")) >= 0) {
 			const line = buffer.slice(0, newline).trim();
@@ -297,7 +310,7 @@ export function mcpLineReader(onReply: (message: McpReply | undefined) => boolea
 			if (line.length === 0) continue;
 			if (onReply(parseMcpReply(line))) return false;
 		}
-		return buffer.trim().length > maxBufferChars;
+		return buffer.length > maxBufferChars;
 	};
 }
 
@@ -351,7 +364,9 @@ function ask(socketPath: string, tool: string, args: Record<string, unknown>, ti
 /**
  * Runs one CodeGraph MCP tool call through a daemon already serving `root`, the same text the CLI
  * prints but without a process of its own. It only reads the daemon registry and connects: it never
- * starts a daemon, and never throws. A silent daemon hands the rest of the budget to the next one.
+ * starts a daemon, and never throws. A silent daemon hands the rest of the budget to the next one,
+ * and the budget covers discovery too: its pipe probes shrink to the leftover and no socket opens
+ * once the deadline is spent.
  */
 export async function exploreViaDaemon(
 	root: string,
@@ -364,8 +379,12 @@ export async function exploreViaDaemon(
 	try {
 		const deadline = Date.now() + timeoutMs;
 		let silent = false;
-		for (const socketPath of daemonSockets(root, registryDir)) {
-			const result = await ask(socketPath, tool, args, deadline - Date.now(), helloTimeoutMs);
+		for (const socketPath of daemonSockets(root, registryDir, deadline)) {
+			// Discovery and every earlier attempt already spent part of the budget; a spent deadline
+			// opens no socket, because ask's own clamp would otherwise buy one more attempt.
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break;
+			const result = await ask(socketPath, tool, args, remaining, helloTimeoutMs);
 			if (result.status === "silent") {
 				silent = true;
 				continue;
@@ -387,19 +406,27 @@ export type DaemonHealth = "ok" | "wedged" | "unreachable";
 /**
  * The health check for the warm gate: liveness is not serviceability. A daemon can pass every
  * registry check — pid running, socket present, connections accepted — and still never answer,
- * so the gate asks the newest live daemon one real query (the same call the stdio warm-up
- * makes) and maps the answer: ok serves, silent or timeout is wedged (the daemon holds its
- * lock and cannot serve), unavailable has nothing to talk to. Reads and connects only: it
- * never starts anything, kills nothing, and never throws.
+ * so the gate asks the live daemons one real query each (the same call the stdio warm-up makes),
+ * newest first within one probe deadline, and maps the answer: ok serves, silent or timeout is
+ * wedged (the daemon holds its lock and cannot serve), unavailable has nothing to talk to. Reads
+ * and connects only: it never starts anything, kills nothing, and never throws.
  */
 export async function daemonHealth(cwd: string, registryDir?: string, helloTimeoutMs: number = DAEMON_HELLO_TIMEOUT_MS, probeTimeoutMs: number = 5_000): Promise<DaemonHealth> {
 	try {
 		const sockets = daemonSockets(cwd, registryDir);
 		if (sockets.length === 0) return "unreachable";
-		const outcome = await ask(sockets[0], "codegraph_explore", { query: "main" }, probeTimeoutMs, helloTimeoutMs);
-		if (outcome.status === "ok") return "ok";
-		if (outcome.status === "silent" || outcome.status === "timeout") return "wedged";
-		return "unreachable";
+		// Every candidate shares the one probe deadline, and an older daemon answers for a silent
+		// newest one before the gate calls the project wedged — the same fallback a search gets.
+		const deadline = Date.now() + probeTimeoutMs;
+		let wedged = false;
+		for (const socketPath of sockets) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break;
+			const outcome = await ask(socketPath, "codegraph_explore", { query: "main" }, remaining, helloTimeoutMs);
+			if (outcome.status === "ok") return "ok";
+			if (outcome.status === "silent" || outcome.status === "timeout") wedged = true;
+		}
+		return wedged ? "wedged" : "unreachable";
 	} catch {
 		return "unreachable";
 	}

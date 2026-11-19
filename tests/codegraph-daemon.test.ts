@@ -21,6 +21,8 @@ interface FakeDaemon {
 	registryDir: string;
 	/** Resolves when the server is listening and its socket file exists. */
 	ready: Promise<void>;
+	/** How many clients the server accepted; the budget tests assert no socket was opened. */
+	connections: () => number;
 }
 
 /**
@@ -58,10 +60,14 @@ function fakeDaemon(
 	mkdirSync(registryDir, { recursive: true });
 	const socketPath = fakeDaemonSocketPath(process.platform, home);
 	let resolveReady: () => void = () => {};
-	const ready = new Promise<void>((resolve) => {
+	let rejectReady: (error: Error) => void = () => {};
+	const ready = new Promise<void>((resolve, reject) => {
 		resolveReady = resolve;
+		rejectReady = reject;
 	});
+	let connections = 0;
 	const server = net.createServer((socket) => {
+		connections++;
 		// A client that settles mid-conversation destroys its socket; on Windows named pipes
 		// the server's in-flight write then fails asynchronously with EPIPE, and an unhandled
 		// 'error' event would rethrow into the test run (win-only, RID 20261118-165111).
@@ -81,10 +87,13 @@ function fakeDaemon(
 			}
 		});
 	});
+	// A listen failure — a socket path past the platform's length limit, a busy pipe — arrives as an
+	// 'error' event; routed into the promise it rejects ready with the cause instead of hanging.
+	server.on("error", rejectReady);
 	server.listen(socketPath, () => resolveReady());
 	t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
 	writeFileSync(join(registryDir, options.recordName ?? "record.json"), JSON.stringify({ root: project, socketPath, startedAt: options.startedAt ?? 1, pid: process.pid }));
-	return { socketPath, registryDir, ready };
+	return { socketPath, registryDir, ready, connections: () => connections };
 }
 
 const HELLO = JSON.stringify({ codegraph: "1.6.0", protocol: 1 });
@@ -144,6 +153,23 @@ test("daemonHealth: a serving daemon is ok, a silent one wedged, no live daemon 
 
 	const absent = dir(t, "health-absent");
 	assert.equal(await daemonHealth(absent, join(absent, "registry")), "unreachable", "no live daemon sockets: no connection attempted");
+
+	const gone = dir(t, "health-gone");
+	const goneRegistry = join(gone, "registry");
+	mkdirSync(goneRegistry, { recursive: true });
+	writeFileSync(join(goneRegistry, "daemon.sock"), "");
+	writeFileSync(join(goneRegistry, "record.json"), JSON.stringify({ root: gone, socketPath: join(goneRegistry, "daemon.sock"), startedAt: 1, pid: process.pid }));
+	assert.equal(await daemonHealth(gone, goneRegistry), "unreachable", "a socket file without a listener is nobody to talk to, not a wedged daemon");
+});
+
+test("daemonHealth checks older candidates before declaring the project daemon wedged", async (t) => {
+	const project = dir(t, "health-fallback");
+	const registryDir = dir(t, "health-fallback-registry");
+	const silent = fakeDaemon(t, project, undefined, INITIALIZED, ANSWER, { registryDir, recordName: "newer.json", startedAt: 2 });
+	const older = fakeDaemon(t, project, HELLO, INITIALIZED, ANSWER, { registryDir, recordName: "older.json", startedAt: 1 });
+	await silent.ready;
+	await older.ready;
+	assert.equal(await daemonHealth(project, registryDir, 50), "ok", "the newest is silent but the older daemon still serves, so the project is not wedged");
 });
 
 test("null and other non-object JSON replies never reach dispatch on either transport", async (t) => {
@@ -180,13 +206,16 @@ test("null and other non-object JSON replies never reach dispatch on either tran
 	assert.deepEqual(await exploreViaDaemon(healthy, "codegraph_explore", { query: "main" }, 2_000, good.registryDir), { status: "ok", text: "daemon answer" }, "a well-formed conversation still dispatches");
 });
 
-test("daemonFor and the sockets iterate live daemons newest first", async (t) => {
+test("daemonFor picks the newest of two live daemons in equivalent spellings", async (t) => {
 	const project = dir(t, "newest");
-	const daemon = fakeDaemon(t, project, HELLO, INITIALIZED, ANSWER);
-	await daemon.ready;
-	const found = daemonFor(project, daemon.registryDir);
-	assert.equal(found.alive, true);
-	assert.equal(found.root, project);
+	const registryDir = dir(t, "newest-registry");
+	const older = fakeDaemon(t, `${project}//`, HELLO, INITIALIZED, ANSWER, { registryDir, recordName: "older.json", startedAt: 1 });
+	const newer = fakeDaemon(t, project, HELLO, INITIALIZED, ANSWER, { registryDir, recordName: "newer.json", startedAt: 2 });
+	await older.ready;
+	await newer.ready;
+	const found = daemonFor(project, registryDir);
+	assert.equal(found.alive, true, "both daemons are live for the project");
+	assert.equal(found.root, project, "daemonFor answers with the newer daemon's spelling, not the older one's");
 });
 
 test("two live daemons: the newer socket receives the call first", async (t) => {
@@ -215,6 +244,14 @@ test("a silent newer daemon hands the remaining budget to the older socket", asy
 		{ status: "ok", text: "older answer" },
 		"the newer daemon stayed silent, so the older one answered within the remaining budget",
 	);
+});
+
+test("exploreViaDaemon opens no socket once the deadline is spent", async (t) => {
+	const project = dir(t, "spent");
+	const daemon = fakeDaemon(t, project, HELLO, INITIALIZED, ANSWER);
+	await daemon.ready;
+	assert.deepEqual(await exploreViaDaemon(project, "codegraph_explore", { query: "main" }, 0, daemon.registryDir), { status: "unavailable" }, "a spent deadline answers without a conversation");
+	assert.equal(daemon.connections(), 0, "the clamp inside ask must not buy one more socket attempt");
 });
 
 test("registeredDaemons reads the registry once per project per window", (t) => {
@@ -367,6 +404,45 @@ test("swapping the probe layer starts with an empty cache", (t) => {
 	assert.equal(probes, 1, "a remembered positive dies with the layer that recorded it");
 });
 
+test("the real probe worker settles through the shared cell on both outcomes", async (t) => {
+	// The pipe-shaped name is relative, so both the listener and the probe worker resolve it against
+	// the working directory: a short temporary one keeps the bind inside the platform's socket path
+	// length limit.
+	const home = dir(t, "probe-real");
+	const before = process.cwd();
+	process.chdir(home);
+	const pipe = namedPipe(`p-${randomUUID().slice(0, 8)}`);
+	const server = net.createServer(() => {});
+	const listening = new Promise<void>((resolve, reject) => {
+		server.on("error", reject);
+		server.listen(pipe, () => resolve());
+	});
+	t.after(() => {
+		process.chdir(before);
+		return new Promise<void>((resolve) => server.close(() => resolve())).then(() => rmSync(join(home, pipe), { force: true }));
+	});
+	await listening;
+	assert.equal(socketPresent(pipe, "win32"), true, "the worker's connect lands in the shared cell and wakes the waiter as open");
+	const absent = namedPipe(`a-${randomUUID().slice(0, 8)}`);
+	assert.equal(socketPresent(absent, "win32"), false, "a pipe name with no listener is a clean refusal, not an inconclusive one");
+});
+
+test("socketPresent spends a caller's deadline instead of the full probe budget", (t) => {
+	const pipe = namedPipe("gentle-shell-probe-deadline");
+	const seen: Array<{ path: string; timeoutMs: number }> = [];
+	setPipeProbeForTests((path, timeoutMs) => {
+		seen.push({ path, timeoutMs });
+		return "inconclusive";
+	});
+	t.after(() => setPipeProbeForTests(undefined));
+	assert.equal(socketPresent(pipe, "win32", Date.now() - 1), true, "a spent deadline skips the probe; inconclusive still counts as present");
+	assert.deepEqual(seen, [], "no probe runs once the deadline is gone");
+	assert.equal(socketPresent(pipe, "win32", Date.now() + 20), true, "a shrunken budget still probes fail-safe");
+	assert.equal(seen.length, 1, "the leftover budget bought exactly one probe");
+	const probe = seen[0];
+	assert.ok(probe !== undefined && probe.timeoutMs > 0 && probe.timeoutMs <= 20, "the probe got the leftover, never the full 250ms");
+});
+
 test("daemonFor on win32 lives through the probe and the memoized canonical fold", (t) => {
 	const project = dir(t, "win32-fold");
 	const registry = dir(t, "win32-fold-registry");
@@ -387,21 +463,26 @@ test("daemonFor on win32 lives through the probe and the memoized canonical fold
 	assert.equal(daemonFor(project, registry, "win32").alive, false, "a refused pipe is not a live daemon even with a live pid");
 });
 
-test("mcpLineReader applies the frame cap to the trimmed frame on the partial path too", () => {
+test("mcpLineReader applies the frame cap to the raw remainder on the partial path too", () => {
 	const replies: Array<McpReply | undefined> = [];
 	const read = mcpLineReader((message) => {
 		replies.push(message);
 		return false;
 	}, 9);
-	// The same short reply, once delivered by one chunk that carries its newline and once with
-	// the newline in a later chunk: the unfinished remainder must take the same trimmed measure
-	// the complete line takes, or the split arrival would report a runaway.
-	assert.equal(read('{"id":2}  '), false, "trailing whitespace before the late newline is not frame content");
+	// The complete line keeps its trimmed measure: a frame just under the cap still lands when its
+	// newline arrives separately, and the blank lines after it belong to no frame.
+	assert.equal(read('{"id":2}'), false, "a frame under the cap is buffered while its newline is pending");
 	assert.equal(read("\n"), false);
-	assert.deepEqual(replies, [{ id: 2 }], "the frame reaches dispatch after its newline arrives separately");
+	assert.deepEqual(replies, [{ id: 2 }], "the split arrival still dispatches the frame");
 	replies.length = 0;
 	assert.equal(read('{"id":3}'), false);
 	assert.equal(read("  \n"), false, "a short reply followed by separate blank lines keeps working");
 	assert.deepEqual(replies, [{ id: 3 }]);
 	assert.equal(read("0123456789"), true, "a partial frame whose content itself breaks the cap still answers overflow");
+	// The unfinished remainder takes a raw measure instead: the buffer itself is the memory the cap
+	// guards, so whitespace with no newline to trim it against crosses the cap as surely as content.
+	assert.equal(read(" ".repeat(10)), true, "a whitespace-only remainder past the cap is overflow, not free memory");
+	const flood = mcpLineReader(() => false, 9);
+	assert.equal(flood(" ".repeat(5)), false, "whitespace accumulates across chunks while it fits the cap");
+	assert.equal(flood(" ".repeat(5)), true, "the raw cap stops the accumulation once it does not");
 });
