@@ -190,8 +190,8 @@ export function liveDaemons(cwd: string, registryDir?: string, platform: NodeJS.
 }
 
 /** The project's newest daemon from CodeGraph's own registry. Reads only; starts nothing. */
-export function daemonFor(cwd: string, registryDir?: string, platform: NodeJS.Platform = process.platform): DaemonInfo {
-	const alive = liveDaemons(cwd, registryDir, platform)[0];
+export function daemonFor(cwd: string, registryDir?: string, platform: NodeJS.Platform = process.platform, deadlineAt?: number): DaemonInfo {
+	const alive = liveDaemons(cwd, registryDir, platform, deadlineAt)[0];
 	return { alive: alive !== undefined, root: (alive ?? registeredDaemons(cwd, registryDir, platform)[0])?.root };
 }
 

@@ -10,7 +10,7 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { isWorkspaceProjectRoot } from "../extensions/codegraph-tools.ts";
-import { daemonFor } from "../lib/codegraph-daemon.ts";
+import { daemonFor, setPipeProbeForTests } from "../lib/codegraph-daemon.ts";
 import { clearCodegraphResolveCache } from "../lib/codegraph-cli-resolve.ts";
 import { lockPathFor, readLeaseVerdict } from "../lib/codegraph-lease.ts";
 import { seedWorktreeIndex } from "../lib/codegraph-seed.ts";
@@ -680,7 +680,7 @@ function wedgedDaemon(t: test.TestContext, project: string): { cwd: string; regi
  * then the initialize and tools/call replies (the daemon suite's fakeDaemon pattern), bound to a
  * socket of its own but never registered: when the record appears is the caller's move (the
  * adoption race needs the winner absent at first). */
-function speakingServer(t: test.TestContext, registry: string): { socketPath: string; ready: Promise<void> } {
+function speakingServer(t: test.TestContext, registry: string, onCall?: () => void): { socketPath: string; ready: Promise<void> } {
 	const socketPath = fakeDaemonSocketPath(process.platform, registry);
 	const hello = JSON.stringify({ codegraph: "1.6.0", protocol: 1 });
 	const initialized = { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "fake", version: "0" } };
@@ -705,7 +705,10 @@ function speakingServer(t: test.TestContext, registry: string): { socketPath: st
 				if (line.length === 0) continue;
 				const message = JSON.parse(line) as { id?: number; method?: string };
 				if (message.method === "initialize") socket.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: initialized }) + "\n");
-				if (message.method === "tools/call") socket.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: answer }) + "\n");
+				if (message.method === "tools/call") {
+					onCall?.();
+					socket.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: answer }) + "\n");
+				}
 			}
 		});
 	});
@@ -795,6 +798,79 @@ test("warmUpDaemonDetailed: an early-exiting lock loser adopts the winner's daem
 	const outcome = await warmUpDaemonDetailed(cwd, false, 5_000, registry);
 	assert.deepEqual(outcome, { ok: true, adopted: true }, "the loser's exit adopts the winner's live daemon instead of reporting a failed warm-up");
 });
+
+test("warmUpDaemonDetailed: a winner answering after the adoption deadline is not adopted", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX fake-bin harness");
+	const bin = dir(t, "warm-adopt-late-bin");
+	writeFileSync(join(bin, "codegraph"), "#!/bin/sh\nexit 0\n");
+	chmodSync(join(bin, "codegraph"), 0o755);
+	const previousPath = process.env.PATH;
+	const realNow = Date.now;
+	process.env.PATH = `${bin}:${previousPath}`;
+	t.after(() => { process.env.PATH = previousPath; Date.now = realNow; });
+	const cwd = dir(t, "warm-adopt-late");
+	const registry = dir(t, "warm-adopt-late-registry");
+	let calls = 0;
+	const winner = speakingServer(t, registry, () => {
+		calls += 1;
+		Date.now = () => realNow() + 10_000;
+	});
+	await winner.ready;
+	setTimeout(() => fakeRegistryRecord(registry, cwd, winner.socketPath, process.pid), 200);
+	const outcome = await warmUpDaemonDetailed(cwd, false, 5_000, registry, 1_000, 2_000);
+	assert.equal(calls, 1, "the winner really answered after the clock crossed the deadline");
+	assert.deepEqual(outcome, { ok: false });
+});
+
+for (const expireAt of ["poll", "discovery"] as const) {
+	test(`warmUpDaemonDetailed: ${expireAt} expiry prevents a health probe`, async (t) => {
+		if (process.platform === "win32") return t.skip("POSIX fake-bin harness");
+		const bin = dir(t, `warm-${expireAt}-bin`);
+		writeFileSync(join(bin, "codegraph"), "#!/bin/sh\nexit 0\n");
+		chmodSync(join(bin, "codegraph"), 0o755);
+		const cwd = dir(t, `warm-${expireAt}`);
+		const registry = dir(t, `warm-${expireAt}-registry`);
+		const previousPath = process.env.PATH;
+		const realNow = Date.now;
+		const realSetTimeout = globalThis.setTimeout;
+		const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+		let offset = 0;
+		let scheduled = 0;
+		const budgets: number[] = [];
+		process.env.PATH = `${bin}:${previousPath}`;
+		Date.now = () => realNow() + offset;
+		setPipeProbeForTests((_path, budget) => {
+			budgets.push(budget);
+			offset = 10_000;
+			return "inconclusive";
+		});
+		globalThis.setTimeout = ((callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+			if (delay !== 250) return realSetTimeout(callback, delay, ...args);
+			scheduled += 1;
+			return realSetTimeout(() => {
+				fakeRegistryRecord(registry, cwd, ["", "", ".", "pipe", "adoption-deadline"].join(DAEMON_BS), process.pid);
+				Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+				if (expireAt === "poll") offset = 10_000;
+				callback(...args);
+			}, 0);
+		}) as typeof setTimeout;
+		t.after(() => {
+			globalThis.setTimeout = realSetTimeout;
+			Date.now = realNow;
+			process.env.PATH = previousPath;
+			Object.defineProperty(process, "platform", platform);
+			setPipeProbeForTests(undefined);
+		});
+		const outcome = await warmUpDaemonDetailed(cwd, false, 5_000, registry, 1_000, 2_000);
+		assert.deepEqual(outcome, { ok: false });
+		assert.equal(scheduled, 1, "the first poll scheduled exactly one successor");
+		if (expireAt === "poll") assert.deepEqual(budgets, [], "an expired poll performs no discovery");
+		else {
+			assert.equal(budgets.length, 1, "discovery consumes the budget without starting health discovery");
+			assert.ok(budgets[0]! > 0 && budgets[0]! <= 250, "the pipe probe receives a bounded budget");
+		}
+	});
+}
 
 test("warmUpDaemonDetailed: a lock loser with no winner inside the adoption window fails", async (t) => {
 	if (process.platform === "win32") return t.skip("POSIX fake-bin harness");

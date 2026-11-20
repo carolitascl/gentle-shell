@@ -383,21 +383,30 @@ export async function warmUpDaemonDetailed(cwd: string, background = false, time
 			const poll = () => {
 				// The overall timeout or another settlement path may have finished between ticks.
 				if (settled) return;
+				if (Date.now() >= deadline) {
+					settle("failed");
+					return;
+				}
 				let alive = false;
 				try {
-					alive = daemonFor(cwd, registryDir).alive;
+					alive = daemonFor(cwd, registryDir, undefined, deadline).alive;
 				} catch {
 					/* an unreadable registry holds no winner to adopt */
+				}
+				const remaining = deadline - Date.now();
+				if (remaining <= 0) {
+					settle("failed");
+					return;
 				}
 				if (alive) {
 					// The winner is a candidate, not a verdict: liveness alone would adopt a wedged
 					// winner — the same daemon the warm gate at the start of this call reports as
 					// wedged. One real answer adopts it; anything else keeps polling for a winner
 					// that can actually serve, within the remaining window the overall timeout caps.
-					void daemonHealth(cwd, registryDir, helloTimeoutMs).then(
+					void daemonHealth(cwd, registryDir, helloTimeoutMs, remaining).then(
 						(health) => {
 							if (settled) return;
-							if (health === "ok") {
+							if (health === "ok" && Date.now() < deadline) {
 								settle("adopted");
 								return;
 							}
