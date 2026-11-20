@@ -207,15 +207,34 @@ function tmpForGuard(): string {
 /** Workspaces whose guard already passed this prompt: git is asked once per cwd per prompt. */
 const workspaceVerified = new Set<string>();
 
+/** The metadata directory a worktree-style `.git` file names, resolved the way Git reads it:
+ * an absolute gitdir is taken as it is written, a relative one resolves against the `.git`
+ * file's own directory. Anything without a gitdir line is not a metadata pointer. */
+function gitdirTarget(resolved: string): string | undefined {
+	const raw = readFileSync(join(resolved, ".git"), "utf8");
+	const match = /^gitdir:[ \t]*(.+)\r?$/m.exec(raw);
+	if (!match) return undefined;
+	const target = match[1].trim();
+	return isAbsolute(target) ? target : resolve(resolved, target);
+}
+
 /** Whether a validated workspace still carries its repository marker: a Git toplevel always
  * holds `.git` — a directory, or the file a linked worktree or submodule writes — so a
- * cached validation survives only while that marker does. An env-driven GIT_DIR repository
- * without the marker simply re-validates on every call: one extra git run, never a wrong
- * cache hit. */
+ * cached validation survives only while that marker does. A `.git` FILE names its metadata
+ * directory through `gitdir:`, and that target can move independently of the worktree (the
+ * main checkout a linked worktree was created from can be renamed away while the worktree's
+ * `.git` file survives), so the file counts as a marker only while the metadata it names
+ * still exists. An env-driven GIT_DIR repository without the marker simply re-validates on
+ * every call: one extra git run, never a wrong cache hit. */
 function gitRootMarkerPresent(resolved: string): boolean {
 	try {
-		lstatSync(join(resolved, ".git"));
-		return true;
+		const markerPath = join(resolved, ".git");
+		if (lstatSync(markerPath).isDirectory()) return true;
+		// A symlinked `.git` resolving to a directory is metadata as well; only a regular file
+		// carries the gitdir pointer the cache must follow.
+		if (statSync(markerPath).isDirectory()) return true;
+		const target = gitdirTarget(resolved);
+		return target !== undefined && statSync(target).isDirectory();
 	} catch {
 		return false;
 	}
@@ -618,6 +637,13 @@ function endOfHeredocBody(command: string, from: number, delimiter: HeredocDelim
 	}
 }
 
+/** One executable command of a shell command list with the operator that introduced it: the
+ * separator between it and the previous command, or "" for the first command. */
+interface ShellListCommand {
+	text: string;
+	operator: string;
+}
+
 /**
  * The executable commands of a shell command list: an unquoted `&&`, `||`, `|`, `;`, `&`, or
  * newline ends one command and starts the next, while quotes keep a separator as content — an
@@ -630,9 +656,12 @@ function endOfHeredocBody(command: string, from: number, delimiter: HeredocDelim
  * closing delimiter line.
  * A comment — a # at the start of a word — is comment text to the end of its line: quotes
  * and separators inside it open and end nothing, and only its newline still ends the command.
+ * Each command carries the operator that introduced it, so a conditional list's branches can
+ * be told apart: a command after `&&` runs only behind a success, one after `||` only behind
+ * a failure.
  */
-function shellCommandList(command: string): string[] {
-	const commands: string[] = [];
+function shellCommandList(command: string): ShellListCommand[] {
+	const commands: ShellListCommand[] = [];
 	let current = "";
 	let quote: "'" | '"' | undefined;
 	let escaped = false;
@@ -640,6 +669,9 @@ function shellCommandList(command: string): string[] {
 	// The word-start state the comment boundary needs, tracked instead of re-derived from
 	// the last raw character: an escaped space keeps the word open, so a # after it is literal.
 	let wordStart = true;
+	// The separator that introduced the command being accumulated: "" for the first command,
+	// one character for `;` `&` `|` and newline, two for the doubled `&&` and `||`.
+	let operator = "";
 	for (const char of stripHeredocBodies(command)) {
 		// Comment text: a word-initial # runs to the end of the line, and only the newline
 		// that ends it still separates commands.
@@ -685,16 +717,18 @@ function shellCommandList(command: string): string[] {
 			continue;
 		}
 		if (char === "\n" || char === ";" || char === "&" || char === "|") {
-			commands.push(current);
+			commands.push({ text: current, operator });
 			current = "";
 			wordStart = true;
+			// A doubled & or | is one operator (`&&`, `||`), never two separators.
+			operator = operator === char && (char === "&" || char === "|") ? operator + char : char;
 			continue;
 		}
 		current += char;
 		wordStart = COMMENT_WORD_BOUNDARY.test(char);
 	}
-	commands.push(current);
-	return commands.filter((part) => part.trim().length > 0);
+	commands.push({ text: current, operator });
+	return commands.filter((part) => part.text.trim().length > 0);
 }
 
 /**
@@ -716,6 +750,8 @@ function cdTargetDir(rest: string, cwd: string | undefined): string | undefined 
 	if (words.length !== 1) return undefined;
 	const word = words[0] ?? "";
 	if (/[$~(`]/.test(word)) return undefined;
+	// `cd -` means OLDPWD: a directory this walk cannot establish, never a child spelled "-".
+	if (word === "-") return undefined;
 	if (isAbsolute(word)) return word;
 	return cwd === undefined ? undefined : resolve(cwd, word);
 }
@@ -736,14 +772,46 @@ interface RebuildCommand {
  * cannot read. */
 const UNTRACKABLE_CWD_COMMAND = /^[$`]|^\(|^(?:eval|source|builtin|command|pushd|popd)\b|^\.\s/;
 
+/** Whether one command of a list certainly succeeds or certainly fails, as far as this walk
+ * can tell: only the constant-status builtins settle their branch; anything else — and
+ * anything this walk reads as a directory-moving form — is unknowable. */
+function staticExitStatus(rest: string): boolean | undefined {
+	const command = rest.trim();
+	if (command === "true") return true;
+	if (command === "false") return false;
+	return undefined;
+}
+
+/** Whether a cd joined by `operator` runs, given the previous command's known verdict: the
+ * list start and the unconditional operators always run, `&&` runs only behind a success
+ * and `||` only behind a failure, and an unknowable verdict leaves the branch unknowable. */
+function branchRuns(operator: string, previousVerdict: boolean | undefined): boolean | undefined {
+	if (operator !== "&&" && operator !== "||") return true;
+	if (previousVerdict === undefined) return undefined;
+	return operator === "&&" ? previousVerdict : !previousVerdict;
+}
+
 function codegraphIndexCommands(command: string, startCwd: string): RebuildCommand[] {
 	const rebuild = /^codegraph\s+(index|init)\b/;
 	const rebuilds: RebuildCommand[] = [];
 	let cwd: string | undefined = startCwd;
+	// Whether the previous command certainly succeeded or failed, so a conditional cd's branch
+	// is known; undefined when the shell's path through the list cannot be evaluated here.
+	let previousVerdict: boolean | undefined = true;
 	for (const part of shellCommandList(command)) {
-		const parsed = leadingAssignments(part);
+		const parsed = leadingAssignments(part.text);
 		if (parsed.rest === "cd" || parsed.rest.startsWith("cd ") || parsed.rest.startsWith("cd\t")) {
-			cwd = cdTargetDir(parsed.rest, cwd);
+			// The cd moves the tracked directory only when its own branch runs: a branch this
+			// walk cannot evaluate may have moved it in a form it cannot name either, so the
+			// tracked directory becomes unresolved — never the skipped branch's destination,
+			// which the shell may never have entered and which must not stand as proof of the
+			// effective directory.
+			const runs = branchRuns(part.operator, previousVerdict);
+			if (runs === true) cwd = cdTargetDir(parsed.rest, cwd);
+			else if (runs === undefined) cwd = undefined;
+			// runs === false: the branch is skipped and the shell stays where it was. A cd that
+			// ran counts as a success — whether its target exists is beyond this walk.
+			previousVerdict = runs === false ? previousVerdict : runs === true ? true : undefined;
 			continue;
 		}
 		// A command that can move the directory in a form this walk cannot follow makes
@@ -753,6 +821,7 @@ function codegraphIndexCommands(command: string, startCwd: string): RebuildComma
 		if (verb !== null) {
 			rebuilds.push({ rest: parsed.rest, verb: verb[1] as "index" | "init", allowIndexOverride: parsed.allowIndexOverride, cwd });
 		}
+		previousVerdict = staticExitStatus(parsed.rest);
 	}
 	return rebuilds;
 }
@@ -1204,6 +1273,20 @@ export function warmNotice(outcome: WarmUpOutcome, cwd: string): { text: string;
 	return { text: `CodeGraph warm-up failed in ${cwd}`, level: "warning" };
 }
 
+/** Delivers a warm-up completion notice through the say handle of the session that started the
+ * warm-up: a handle that is no longer the current session's belongs to a session that ended or
+ * was replaced, so its completion is discarded instead of announcing through the newer session
+ * and suppressing that session's own deferred start notice. */
+function sayWarmNotice(
+	say: ((text: string, level: "info" | "warning") => void) | undefined,
+	outcome: WarmUpOutcome,
+	cwd: string,
+): void {
+	if (say === undefined || say !== warmNoticeSay) return;
+	const notice = warmNotice(outcome, cwd);
+	say(notice.text, notice.level);
+}
+
 /**
  * The notify for the index action a session start is about to run: the init line announces
  * initialization before the first index is built, the sync line keeps its existing text.
@@ -1332,23 +1415,27 @@ export function createCodeGraphTool(
 		// The win32 query path never awaits its warm-up (S9), so there it runs backgrounded — an
 		// unref'ed warm-up cannot keep the session alive; POSIX races its wait, never blocking past it.
 		// A warm this path started announces its success through the same ready line the lazy
-		// re-warm emits — the session-owned say handle — while failures stay silent: the
-		// query path is best effort and already falls back to the CLI.
-		warm = (project: string, timeoutMs: number) => warmUpDaemon(project, true, timeoutMs).then((warmed) => {
-			if (!warmed) return false;
-			const notice = warmNotice({ ok: true }, project);
-			warmNoticeSay?.(notice.text, notice.level);
-			return true;
-		}),
+		// re-warm emits — bound to the session that started the warm-up — while failures stay
+		// silent: the query path is best effort and already falls back to the CLI.
+		warm = (project: string, timeoutMs: number) => {
+			const say = warmNoticeSay;
+			return warmUpDaemon(project, true, timeoutMs).then((warmed) => {
+				if (!warmed) return false;
+				sayWarmNotice(say, { ok: true }, project);
+				return true;
+			});
+		},
 		// The lazy re-warm announces only success: a daemon that stays dead is re-warmed by every
 		// query, and failure notices there would be per-query noise the CLI fallback already
 		// answers - one ready line when the daemon is back is the whole message.
-		rewarm = (project: string) => maybeRewarm(project, (daemonProject) => warmUpDaemonDetailed(daemonProject, true).then((outcome) => {
-			if (!outcome.ok) return false;
-			const notice = warmNotice(outcome, project);
-			warmNoticeSay?.(notice.text, notice.level);
-			return true;
-		})),
+		rewarm = (project: string) => maybeRewarm(project, (daemonProject) => {
+			const say = warmNoticeSay;
+			return warmUpDaemonDetailed(daemonProject, true).then((outcome) => {
+				if (!outcome.ok) return false;
+				sayWarmNotice(say, outcome, project);
+				return true;
+			});
+		}),
 		syncRun = runCodegraph,
 		gitRun = defaultGitRun,
 		initLock = acquireInitLock,
@@ -1478,10 +1565,15 @@ export function createCodeGraphTool(
 					if (viaDaemon?.status === "timeout" || viaDaemon?.status === "unavailable") {
 						// The post-warm attempt still cannot serve — wedged (timeout) or refusing (unavailable,
 						// e.g. no project loaded): the CLI answers until the next turn instead of re-paying
-						// attempt+warm+attempt on every query.
-						daemonSkipUntil.set(cwd, Date.now() + DAEMON_SKIP_MS);
-						// Fresh query evidence supersedes a startup verdict: this entry is prompt-scoped.
-						startupDaemonSkip.delete(cwd);
+						// attempt+warm+attempt on every query. A search that started before session start can
+						// publish its failure after the startup wedge was recorded; the startup verdict then
+						// keeps its own deadline and marker instead of being demoted to a prompt-scoped
+						// failure the next prompt boundary would clear.
+						if (!startupDaemonSkip.has(cwd)) {
+							daemonSkipUntil.set(cwd, Date.now() + DAEMON_SKIP_MS);
+							// Fresh query evidence supersedes a startup verdict: this entry is prompt-scoped.
+							startupDaemonSkip.delete(cwd);
+						}
 					}
 				}
 				if (viaDaemon?.status === "ok") return finish(truncateOutput(viaDaemon.text), { viaDaemon: true, syncTriggered });
