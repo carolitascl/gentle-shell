@@ -675,3 +675,27 @@ test("ensureDirectExposure: an atomic replacement after the verified read is a c
 	assert.equal(wrote, false, "nothing was written over the editor's save");
 	assert.equal(readFileSync(config, "utf8"), editorSaved, "the editor's changes survive byte-for-byte");
 });
+
+test("ensureDirectExposure: two unknown file identities are a conflict, never a write through an unproven file", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-unproven-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const config = join(dir, "mcp.json");
+	writeFileSync(config, WITH_CODEGRAPH, "utf8");
+	// The adapter supplies the identity hook, so the publish must prove it lands on the file the
+	// verified read observed: an identity that is unknown on both sides proves nothing — another
+	// process can move the config aside for the reread and delete it before the publication — and
+	// an unknown observation is a mismatch like any other, never a match by absence.
+	let wrote: string | undefined;
+	const io: EnsureExposureIo = {
+		read: (path) => (existsSync(path) ? readFileSync(path, "utf8") : undefined),
+		identityOf: () => undefined,
+		write: (path, text) => {
+			wrote = path;
+			atomicWriteFile(path, text);
+		},
+	};
+	assert.equal(ensureDirectExposure(config, io).outcome, "conflict", "an unprovable identity is a conflict, not an update");
+	assert.equal(wrote, undefined, "nothing was written through the unknown identity");
+	assert.equal(readFileSync(config, "utf8"), WITH_CODEGRAPH, "the config is left exactly as it was");
+	assert.deepEqual(readdirSync(dir), ["mcp.json"], "the retries leave no temp file or lock behind");
+});

@@ -395,7 +395,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * re-checks the destination it locked and refuses with `"conflict"` when the file there has
  * been replaced, so the update never writes through a link it did not lock — and refuses the
  * same way when the file there is no longer the exact file the verified read observed (an
- * editor's atomic same-path save), so a later write can never discard it.
+ * editor's atomic same-path save), so a later write can never discard it; an identity the io
+ * can no longer observe at all is the same refusal, never a match by absence.
  */
 export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaultIo): EnsureExposureResult {
 	// The lock, the reads, and the publish all address the destination a write itself resolves
@@ -453,7 +454,23 @@ export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaul
 			// And the file there must still be the exact file the verified read observed: an
 			// editor's atomic save after that read keeps the destination identical but always
 			// replaces the inode, and writing on top of it would discard the editor's changes.
-			if (io.identityOf !== undefined && io.identityOf(target) !== verifiedIdentity) return { path, outcome: "conflict" };
+			// Both observations must exist and agree: an identity that is unknown on either side
+			// proves nothing about the file the read observed — another process can move the config
+			// aside for the reread and delete it before the publication, and a write through that
+			// unknown would recreate a config that is gone. An unknown publishes nothing and gets the
+			// bounded restart, so a transient stat failure recovers while an unknown that survives
+			// the budget is a conflict; an adapter that supplies no identity hook keeps the verified
+			// text comparison above as its only guard.
+			if (io.identityOf !== undefined) {
+				const observedIdentity = io.identityOf(target);
+				if (verifiedIdentity === undefined || observedIdentity === undefined) {
+					if (attempt >= MAX_UPDATE_ATTEMPTS) return { path, outcome: "conflict" };
+					continue;
+				}
+				// Two defined observations that differ are two different files at one path: no restart
+				// makes that a match, so the update refuses it at once.
+				if (observedIdentity !== verifiedIdentity) return { path, outcome: "conflict" };
+			}
 			io.write(target, `${JSON.stringify(doc, null, 2)}\n`);
 			return { path, outcome: "added" };
 		}

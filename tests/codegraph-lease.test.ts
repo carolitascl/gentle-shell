@@ -1802,10 +1802,20 @@ test("an adoption whose restore loses to a competing publication recovers the di
 	const goB = join(sandbox, "b-go");
 	const markerB = join(sandbox, "b-result");
 	const doneB = join(sandbox, "b-done");
+	// The acknowledgment that releases A: a retry sleep is the only blocking wait this child can
+	// reach once the per-path mutex is held, so a wait it reports after the test cleared the file
+	// is proof that the adoption's restore link met the publication at the path.
+	const ackB = `${markerB}.checked`;
 	const scriptB = join(sandbox, "b.mjs");
 	writeFileSync(scriptB, [
 		'import { existsSync, writeFileSync } from "node:fs";',
 		"const [libHref, tokenPath, ready, go, marker, done] = process.argv.slice(2);",
+		'const ack = marker + ".checked";',
+		"const realWait = Atomics.wait;",
+		"Atomics.wait = (...args) => {",
+		"\twriteFileSync(ack, \"eexist\");",
+		"\treturn realWait(...args);",
+		"};",
 		"const { tryAcquireLease } = await import(libHref);",
 		"const lease = tryAcquireLease(tokenPath, \"sync\", 60_000, Date.now());",
 		"writeFileSync(ready, lease ? \"acquired\" : \"lost\");",
@@ -1859,13 +1869,16 @@ test("an adoption whose restore loses to a competing publication recovers the di
 	// and reverses A's own publication — leaving the path empty beside B's displaced record.
 	// The adoption must recover the displaced lease onto that empty path instead of leaving the
 	// project wedged behind a sidecar until it expires.
+	// The handshake that pins the order the thread names: A stays parked at its scan — its token
+	// provably still at the path — while B's publish link and its first restore both lose to it,
+	// and B acknowledges that first EEXIST from inside its retry loop. Only that acknowledgment
+	// releases A, and the retry that follows A's reversal is B's own next attempt, so neither
+	// child's scheduling is part of the ordering.
+	rmSync(ackB, { force: true }); // while B stays parked at its nonce read, no wait can follow this clear
 	writeSync(parkedAdopted, bTokenBytes);
 	closeSync(parkedAdopted);
-	// The beat that pins the order the thread names: A stays parked at its scan — its token
-	// provably still at the path — while both of B's links run and lose to it. The fixed pause
-	// (well inside a bounded restore recovery) separates B's failed links from A's release, so
-	// the two children never race their critical steps.
-	await new Promise((resolve) => setTimeout(resolve, 50));
+	await waitForFileContents(ackB, "eexist", "the adoption never met the publication at the path");
+	assert.ok(existsSync(path), "the competitor's token still stands at the path when the adoption acknowledges its lost links");
 	releaseParkedFifo(parkedScan);
 	rmSync(lockFifo, { force: true });
 	await waitForFileContents(markerA, "lost", "the competing publication never reported its reversal");

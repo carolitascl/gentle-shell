@@ -198,19 +198,22 @@ test("daemonHealth queries the newest daemon before probing an older candidate",
 	// Bulk discovery probed every candidate before the first query, so on Windows an older pipe's
 	// probe could spend the whole shared deadline and the gate answered unreachable without ever
 	// asking the healthy newest daemon — warm-up then spawned a second daemon for a project the
-	// newest one already served. The clock moves only inside the older pipe's probe, so exactly
-	// that probe decides the deadline is spent; the newest daemon is a plain socket file here and
-	// the platform mock routes only the older record's pipe-shaped path through the probe layer.
+	// newest one already served. The mocked clock is pinned to a fixed base and moves only inside
+	// the older pipe's probe, so exactly that probe decides the deadline is spent — never however
+	// long a paused runner takes before the newest daemon is asked, which real-time offsetting let
+	// spend the deadline — while the real socket handshake gets a separate, generous budget of its
+	// own. The newest daemon is a plain socket file here and the platform mock routes only the
+	// older record's pipe-shaped path through the probe layer.
 	const project = dir(t, "health-interleave");
 	const registry = dir(t, "health-interleave-registry");
 	const healthy = fakeDaemon(t, project, HELLO, INITIALIZED, ANSWER, { registryDir: registry, recordName: "newest.json", startedAt: 2 });
 	await healthy.ready;
 	const olderPipe = namedPipe("gentle-shell-health-interleave-old");
 	writeFileSync(join(registry, "older.json"), JSON.stringify({ root: project, socketPath: olderPipe, startedAt: 1, pid: process.pid }));
-	const realNow = Date.now;
+	const fixedNow = 1_700_000_000_000;
 	let offset = 0;
 	const probed: string[] = [];
-	t.mock.method(Date, "now", () => realNow() + offset);
+	t.mock.method(Date, "now", () => fixedNow + offset);
 	setPipeProbeForTests((path) => {
 		if (path !== olderPipe) return "open";
 		probed.push(path);
@@ -224,7 +227,7 @@ test("daemonHealth queries the newest daemon before probing an older candidate",
 		setPipeProbeForTests(undefined);
 		Object.defineProperty(process, "platform", platformDescriptor);
 	});
-	assert.equal(await daemonHealth(project, registry, 50, 200), "ok", "the newest daemon answered before the older pipe's probe spent the budget");
+	assert.equal(await daemonHealth(project, registry, 2_000, 2_000), "ok", "the newest daemon answered before the older pipe's probe spent the budget");
 	assert.equal(healthy.connections(), 1, "the gate really asked the newest daemon");
 	assert.deepEqual(probed, [], "the older candidate was never probed once the newest daemon answered");
 });
