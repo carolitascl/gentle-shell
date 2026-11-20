@@ -1536,6 +1536,67 @@ test("the guard keeps the caller's directory when a conditional list skips its c
 	assert.equal(unconditional?.block, true, "the successful cd && form still judges the destination");
 });
 
+test("the guard judges a cd's failure path too, because a cd can fail and leave the shell where it was", async (t) => {
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+	codeGraphTools({
+		registerTool() { /* the registered tool's shape is covered above */ },
+		on(event, handler) { handlers.set(event, handler); },
+	} as unknown as ExtensionAPI);
+	const guard = handlers.get("tool_call");
+	const { indexed, fresh } = await spacedWorkspaces(t);
+	const previousOverride = process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	t.after(() => {
+		if (previousOverride === undefined) delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+		else process.env.GENTLE_CODEGRAPH_ALLOW_INDEX = previousOverride;
+	});
+	const verdictFrom = (cwd: string, command: string) =>
+		(guard as (event: unknown, ctx: unknown) => unknown)({ toolName: "bash", input: { command } }, { cwd } as ExtensionContext);
+	const shellQuoted = (path: string) => "'" + path + "'";
+	// A destination that is not there when the guard runs: whether it appears (or is created
+	// by an earlier command) before the cd runs is beyond this walk, so neither outcome is
+	// disproven and both paths stay live.
+	const missing = join(fresh, "missing checkout");
+
+	// The cd fails at run time, so bash stays in the caller's checkout and runs the ||
+	// fallback there: an indexed caller is never proven safe by the missing destination.
+	const fallback = verdictFrom(indexed, "cd " + shellQuoted(missing) + " || codegraph init") as { block?: boolean; reason?: string } | undefined;
+	assert.equal(fallback?.block, true, "a cd that fails leaves the shell in the indexed checkout, where the || fallback rebuilds it");
+	assert.match(fallback?.reason ?? "", /an index already exists/);
+	// An unconditional separator reaches the next command on both paths - the destination when
+	// the cd succeeded, the caller's checkout when it failed - so both are judged.
+	const separated = verdictFrom(indexed, "cd " + shellQuoted(missing) + "; codegraph init") as { block?: boolean } | undefined;
+	assert.equal(separated?.block, true, "a semicolon-reached rebuild is judged in every directory the cd can leave the shell in");
+	// The same failed cd in an unindexed caller leaves the fallback a legitimate first init.
+	assert.equal(verdictFrom(fresh, "cd " + shellQuoted(missing) + " || codegraph init"), undefined, "a failed cd keeps the shell in the unindexed checkout, so its fallback init is that checkout's first");
+	// A || fallback behind a cd that does succeed never runs at all, and the failure path it
+	// would owe is the caller's own unindexed checkout.
+	assert.equal(verdictFrom(fresh, "cd " + shellQuoted(indexed) + " || codegraph init"), undefined, "the || fallback of a successful cd runs only in the caller's checkout, which holds no index here");
+	// The && continuation runs only behind a cd that succeeded, so it is judged at the
+	// destination alone: a missing destination still holds no index.
+	assert.equal(verdictFrom(indexed, "cd " + shellQuoted(missing) + " && codegraph init"), undefined, "a cd that could fail never runs its && rebuild in the caller's checkout");
+	// A cd into a fresh checkout that does succeed keeps judging (and allowing) its own init.
+	assert.equal(verdictFrom(indexed, "cd " + shellQuoted(fresh) + " && codegraph init"), undefined, "a successful directory change into a fresh checkout still authorizes the first init there");
+});
+
+test("the guard keeps a pipeline's status unknowable unless every stage agrees", async (t) => {
+	const verdict = await guardOnIndexedWorkspace(t);
+
+	// Without pipefail the last stage's success is the pipeline's status; with it the earlier
+	// failure decides. Both readings are live, so the || fallback is reachable and the indexed
+	// checkout behind it must be checked.
+	const mixed = verdict("false | true || codegraph init") as { block?: boolean; reason?: string } | undefined;
+	assert.equal(mixed?.block, true, "a pipeline whose stages disagree has no provable status, so its || branch is reachable");
+	assert.match(mixed?.reason ?? "", /an index already exists/);
+	// A pipeline whose every stage holds the same status reports it under either reading, so
+	// the branch behind it stays provably unreachable.
+	assert.equal(verdict("true | true || codegraph init"), undefined, "an all-successful pipeline fails nowhere, so its || branch never runs");
+	// Standalone commands keep pruning by their own certain status.
+	assert.equal(verdict("true || codegraph init"), undefined, "a certain success still makes its || branch unreachable");
+	const reached = verdict("false || codegraph init") as { block?: boolean } | undefined;
+	assert.equal(reached?.block, true, "a certain failure still makes its || branch reach the rebuild");
+});
+
 test("the guard forms a conditional operator only from adjacent separators", async (t) => {
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
 	codeGraphTools({
@@ -2880,6 +2941,10 @@ test("a retry warm-up's ready notice never rides a session that started after it
 		releaseInitialize: initializeHeld,
 		onCall: () => callSeen?.(),
 	});
+	// Every accepted connection, so a failing assertion can drop them: the fixture's close hook
+	// waits for open sockets, and the held reply's own socket stays open until it is released.
+	const sockets: net.Socket[] = [];
+	server.on("connection", (socket) => sockets.push(socket));
 	await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
 	t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
 	writeFileSync(join(registryDir, "record.json"), JSON.stringify({ root: cwd, socketPath, startedAt: 1, pid: process.pid }));
@@ -2905,32 +2970,40 @@ test("a retry warm-up's ready notice never rides a session that started after it
 	});
 
 	const search = tool.execute("test", { operation: "query", query: "symbol" }, undefined, undefined, { cwd } as ExtensionContext);
-	// B's start lands while the retry warm-up is provably pending: the first daemon attempt
-	// settles at once, the warm then holds on the initialize reply, and B starts only after
-	// the daemon saw the warm-up's initialize request — a timer could fire before the warm-up
-	// reached the daemon and leave the assertions below vacuous.
-	await initializeArrived;
-	sessionStart({ reason: "startup" }, {
-		cwd: nonProject("b"),
-		hasUI: true,
-		ui: { notify: (text: string, level: string) => noticesB.push({ text, level }) },
-	} as unknown as ExtensionContext);
-	// The held reply goes out only after B replaced A; the warm-up then completes its
-	// handshake, and its post-initialize request is the proof it succeeded.
-	releaseInitialize?.();
-	await callArrived;
-
+	// One deadline covers both handshake waits and the search itself: a warm-up that never
+	// sends its initialize request, or a client that initializes and never calls, would
+	// otherwise park this test forever - before the old search-only deadline even existed -
+	// with the fixture server still listening. It stays under the runner's own per-test limit
+	// so this report wins the race against a runtime timeout, whose rejection lands on
+	// whichever test runs next.
 	let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+	const deadline = new Promise<never>((_, reject) => {
+		deadlineTimer = setTimeout(() => reject(new Error("the warm-up handshake and the query never settled")), 4_000);
+	});
+	const withinDeadline = <T>(work: Promise<T>): Promise<T> => Promise.race([work, deadline]);
 	try {
-		const result = await Promise.race([
-			search,
-			new Promise<never>((_, reject) => {
-				deadlineTimer = setTimeout(() => reject(new Error("the query never settled")), 5_000);
-			}),
-		]);
+		// B's start lands while the retry warm-up is provably pending: the first daemon attempt
+		// settles at once, the warm then holds on the initialize reply, and B starts only after
+		// the daemon saw the warm-up's initialize request — a timer could fire before the warm-up
+		// reached the daemon and leave the assertions below vacuous.
+		await withinDeadline(initializeArrived);
+		sessionStart({ reason: "startup" }, {
+			cwd: nonProject("b"),
+			hasUI: true,
+			ui: { notify: (text: string, level: string) => noticesB.push({ text, level }) },
+		} as unknown as ExtensionContext);
+		// The held reply goes out only after B replaced A; the warm-up then completes its
+		// handshake, and its post-initialize request is the proof it succeeded.
+		releaseInitialize?.();
+		await withinDeadline(callArrived);
+		const result = await withinDeadline(search);
 		assert.match(result.content[0].text, /cli answer/);
 	} finally {
+		// Every exit path — a timed-out handshake, a failed assertion — releases the held reply
+		// and drops the fixture's sockets, so a regression is reported instead of hanging the run.
 		clearTimeout(deadlineTimer);
+		releaseInitialize?.();
+		for (const socket of sockets) socket.destroy();
 	}
 
 	// The negative assertions are about a warm-up that provably succeeded — the fixture saw

@@ -398,17 +398,21 @@ function rebuildTargetDir(rest: string, cwd: string | undefined): string | undef
  * exactly and never an ancestor — an unindexed directory is a legitimate first init — while
  * `index` rebuilds the exact target when it is initialized and otherwise the nearest
  * initialized ancestor, the resolution a bare `codegraph index` performs from the cwd. A rebuild whose working directory this walk could not determine counts as a rebuild: the original directory is never proof the target is unindexed. */
-function rebuildsExistingIndex(verb: "index" | "init", rest: string, cwd: string | undefined): boolean {
+function rebuildsExistingIndex(verb: "index" | "init", rest: string, cwds: ReadonlyArray<CwdPath>): boolean {
 	// A target this walk cannot place is never proof that nothing existing is rebuilt: the
-	// unknown directory the command runs in may hold the index the rebuild would kill.
-	const target = rebuildTargetDir(rest, cwd);
-	if (target === undefined) return true;
-	if (indexExists(target)) return true;
-	if (verb === "init") return false;
-	for (let current = dirname(target);; current = dirname(current)) {
-		if (indexExists(current)) return true;
-		if (dirname(current) === current) return false;
-	}
+	// unknown directory the command runs in may hold the index the rebuild would kill. Every
+	// directory the command can run in is judged, so a branch that left two paths live is
+	// blocked when either of them holds an index.
+	return cwds.some((cwd) => {
+		const target = rebuildTargetDir(rest, cwd);
+		if (target === undefined) return true;
+		if (indexExists(target)) return true;
+		if (verb === "init") return false;
+		for (let current = dirname(target);; current = dirname(current)) {
+			if (indexExists(current)) return true;
+			if (dirname(current) === current) return false;
+		}
+	});
 }
 
 /** A full re-index from bash is blocked when an index already exists; this is the reason it gets. */
@@ -746,7 +750,7 @@ function shellCommandList(command: string): ShellListCommand[] {
  * on an unrelated earlier command) and its verb, on which the CLI's own target rules key.
  * Every executable command is inspected, not only the first: `cd . && codegraph index .`
  * rebuilds as surely as a bare `codegraph index .`. The word boundary keeps every other
- * subcommand (`codegraph indexer`, `sync`, `query`, `unlock`, `status`) out. Each rebuild also carries the working directory its position in the list runs in: every `cd` the list can follow moves it, and any form that can move it unseen leaves it undefined.
+ * subcommand (`codegraph indexer`, `sync`, `query`, `unlock`, `status`) out. Each rebuild also carries the directories its position in the list can run in: every `cd` the list can follow moves them on the path where it succeeds while a failed one leaves them untouched, conditional branches are followed per outcome, and any form that can move the working directory unseen leaves them unresolvable.
  */
 /** The directory after one `cd` command a flat list can follow: exactly one literal
  * argument — quote removal applied, no variable, tilde, or substitution, no extra words
@@ -764,14 +768,31 @@ function cdTargetDir(rest: string, cwd: string | undefined): string | undefined 
 	return cwd === undefined ? undefined : resolve(cwd, word);
 }
 
+/** A directory a command can run in: the caller's cwd moved by every `cd` the list can
+ * follow, or undefined when a form this walk cannot follow may have moved the shell somewhere
+ * it cannot name. */
+type CwdPath = string | undefined;
+
 /** One rebuild command of a shell list, with the working-directory state at its position. */
 interface RebuildCommand {
 	rest: string;
 	verb: "index" | "init";
 	allowIndexOverride: boolean;
-	/** The directory the command runs in: the caller's cwd moved by every `cd` the list can
-	 * follow, or undefined when a form this walk cannot follow may have moved it. */
-	cwd: string | undefined;
+	/** Every directory the command can run in — one entry per path through the list this walk
+	 * still follows, and a single undefined entry when a form it cannot read may have moved the
+	 * shell somewhere it cannot name. */
+	cwds: ReadonlyArray<CwdPath>;
+}
+
+/** A list that keeps branching past this many live directories is no longer a walk this guard
+ * can place commands in: one unresolvable entry stands for every directory it could reach. */
+const MAX_TRACKED_DIRS = 4;
+
+/** The directories both branch outcomes reach, without duplicates: an unconditional separator
+ * runs the next command whatever the previous status was, so both paths stay live. */
+function unionDirs(branched: ReadonlyArray<CwdPath>, other: ReadonlyArray<CwdPath>): CwdPath[] {
+	const merged = [...branched, ...other].filter((dir, index, all) => all.indexOf(dir) === index);
+	return merged.length > MAX_TRACKED_DIRS ? [undefined] : merged;
 }
 
 /** Commands that can move the working directory outside a literal `cd`: a leading
@@ -790,6 +811,15 @@ function staticExitStatus(rest: string): boolean | undefined {
 	return undefined;
 }
 
+/** The status a pipeline certainly reports, or undefined when this walk cannot prove it: without
+ * pipefail the last stage's status is the pipeline's, while pipefail fails the pipeline as soon
+ * as any stage fails, so only a pipeline whose stages all hold the same constant status reports
+ * that status under both readings. */
+function pipelineExitStatus(stageStatuses: ReadonlyArray<boolean | undefined>): boolean | undefined {
+	const first = stageStatuses[0];
+	return first !== undefined && stageStatuses.every((status) => status === first) ? first : undefined;
+}
+
 /** Whether a cd joined by `operator` runs, given the previous command's known verdict: the
  * list start and the unconditional operators always run, `&&` runs only behind a success
  * and `||` only behind a failure, and an unknowable verdict leaves the branch unknowable. */
@@ -802,42 +832,63 @@ function branchRuns(operator: string, previousVerdict: boolean | undefined): boo
 function codegraphIndexCommands(command: string, startCwd: string): RebuildCommand[] {
 	const rebuild = /^codegraph\s+(index|init)\b/;
 	const rebuilds: RebuildCommand[] = [];
-	let cwd: string | undefined = startCwd;
-	// Whether the previous command certainly succeeded or failed, so a conditional cd's branch
+	const parts = shellCommandList(command);
+	const stageStatuses = parts.map((part) => staticExitStatus(leadingAssignments(part.text).rest));
+	// The status the list carries after each command, after folding every pipeline it belongs
+	// to: only a pipeline's last stage holds the group's status, and only stages that agree
+	// prove it — a later stage's success alone never stands for a pipeline whose earlier stage
+	// may have failed under pipefail.
+	const listStatus: Array<boolean | undefined> = [];
+	for (let index = 0; index < parts.length;) {
+		const start = index;
+		while (index + 1 < parts.length && (parts[index + 1]!.operator === "|" || parts[index + 1]!.operator === "|&")) index += 1;
+		const groupStatus = pipelineExitStatus(stageStatuses.slice(start, index + 1));
+		for (let stage = start; stage <= index; stage += 1) listStatus.push(stage === index ? groupStatus : undefined);
+		index += 1;
+	}
+	// The directories the shell can be in when the next command runs, kept per branch outcome:
+	// a success leaves it in one set, a failure in the other, and the next command's operator
+	// picks the set its own branch really runs in. Both start at the caller's cwd.
+	let successDirs: CwdPath[] = [startCwd];
+	let failureDirs: CwdPath[] = [startCwd];
+	// Whether the previous command certainly succeeded or failed, so a conditional branch
 	// is known; undefined when the shell's path through the list cannot be evaluated here.
 	let previousVerdict: boolean | undefined = true;
-	for (const part of shellCommandList(command)) {
+	for (let index = 0; index < parts.length; index += 1) {
+		const part = parts[index]!;
 		const parsed = leadingAssignments(part.text);
-		if (parsed.rest === "cd" || parsed.rest.startsWith("cd ") || parsed.rest.startsWith("cd\t")) {
-			// The cd moves the tracked directory only when its own branch runs: a branch this
-			// walk cannot evaluate may have moved it in a form it cannot name either, so the
-			// tracked directory becomes unresolved — never the skipped branch's destination,
-			// which the shell may never have entered and which must not stand as proof of the
-			// effective directory.
-			const runs = branchRuns(part.operator, previousVerdict);
-			if (runs === true) cwd = cdTargetDir(parsed.rest, cwd);
-			else if (runs === undefined) cwd = undefined;
-			// runs === false: the branch is skipped and the shell stays where it was. A cd that
-			// ran counts as a success — whether its target exists is beyond this walk.
-			previousVerdict = runs === false ? previousVerdict : runs === true ? true : undefined;
-			continue;
-		}
 		// A branch the shell provably skips runs nothing: it moves no directory, rebuilds no
 		// index, and leaves the last executed status in place for the commands after it —
 		// `true || false && cd elsewhere` skips the false and keeps the success, so the cd
 		// runs. A branch this walk cannot evaluate may have run, so its command stays checked
 		// and the verdict stays unknowable.
 		const runs = branchRuns(part.operator, previousVerdict);
-		if (runs !== false) {
-			// A command that can move the directory in a form this walk cannot follow makes
-			// every later command's directory unknowable.
-			if (UNTRACKABLE_CWD_COMMAND.test(parsed.rest)) cwd = undefined;
-			const verb = rebuild.exec(parsed.rest);
-			if (verb !== null) {
-				rebuilds.push({ rest: parsed.rest, verb: verb[1] as "index" | "init", allowIndexOverride: parsed.allowIndexOverride, cwd });
-			}
-			previousVerdict = runs === true ? staticExitStatus(parsed.rest) : undefined;
+		if (runs === false) continue;
+		// The directories this command can run in: an && branch only behind a success, an ||
+		// branch only behind a failure, and an unconditional separator after either outcome.
+		const here = part.operator === "&&" ? successDirs : part.operator === "||" ? failureDirs : unionDirs(successDirs, failureDirs);
+		if (parsed.rest === "cd" || parsed.rest.startsWith("cd ") || parsed.rest.startsWith("cd\t")) {
+			// A cd carries the shell to its target only when it succeeds: a target that is missing,
+			// or that the shell may not enter, fails and leaves the shell where it was. Both
+			// outcomes stay tracked — the destination on success, the same directories on failure —
+			// so the branch a failed cd sends the shell into is judged instead of being dropped as
+			// unreachable. A form whose target this walk cannot name leaves the success path
+			// unresolvable, never the destination as proof of the effective directory.
+			successDirs = here.map((dir) => cdTargetDir(parsed.rest, dir));
+			failureDirs = here;
+			previousVerdict = undefined;
+			continue;
 		}
+		// Any other command leaves the directory alone, on either outcome — until one that can
+		// move it in a form this walk cannot follow makes every later command's directory
+		// unknowable.
+		successDirs = UNTRACKABLE_CWD_COMMAND.test(parsed.rest) ? [undefined] : here;
+		failureDirs = successDirs;
+		const verb = rebuild.exec(parsed.rest);
+		if (verb !== null) {
+			rebuilds.push({ rest: parsed.rest, verb: verb[1] as "index" | "init", allowIndexOverride: parsed.allowIndexOverride, cwds: here });
+		}
+		previousVerdict = runs === true ? listStatus[index] : undefined;
 	}
 	return rebuilds;
 }
@@ -1752,7 +1803,7 @@ export default function codeGraphTools(pi: ExtensionAPI): void {
 			// `index` the nearest initialized ancestor above it, the resolution a bare call performs.
 			// A rebuild carrying its own override is already authorized: it is excluded here, so an
 			// ordinary first init elsewhere in the list never blocks on the authorized sibling's target.
-			if (!rebuilds.some((rebuild) => !rebuild.allowIndexOverride && rebuildsExistingIndex(rebuild.verb, rebuild.rest, rebuild.cwd))) return undefined;
+			if (!rebuilds.some((rebuild) => !rebuild.allowIndexOverride && rebuildsExistingIndex(rebuild.verb, rebuild.rest, rebuild.cwds))) return undefined;
 			return { block: true, reason: CODEGRAPH_INDEX_BLOCK_REASON };
 		} catch {
 			return undefined;
