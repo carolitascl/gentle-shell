@@ -137,6 +137,23 @@ function deriveMachineIdentity(): string | null {
 }
 
 /**
+ * Tri-state pid probe for host-less reclaims: ESRCH alone confirms death in this namespace,
+ * EPERM confirms existence under another user, and any other failure proves nothing — the
+ * caller keeps its fail-closed verdict instead of treating the lookup as proof of death.
+ */
+function pidLivenessHere(pid: number): "alive" | "dead" | "unproven" {
+	try {
+		process.kill(pid, 0);
+		return "alive";
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "EPERM") return "alive";
+		if (code === "ESRCH") return "dead";
+		return "unproven";
+	}
+}
+
+/**
  * Reads a token file and judges it. An expired token or a dead holder is stale (stealable) — but
  * only on the host that can prove the holder's pid local (see leaseHostIdentity); anywhere else
  * the verdict is unknown. A damaged or unreadable file is unknown too, and unknown is fail-closed:
@@ -151,9 +168,11 @@ function deriveMachineIdentity(): string | null {
  * hard displacement bound for a token whose host identity matches this one: it is reclaimed even
  * while its local holder's pid still lives (a wedged holder must not keep the lease forever);
  * the displaced holder's own state changes stay nonce-fenced in release() and adopt(). A
- * host-less expired token is reclaimed only once its holder pid is verifiably dead here —
- * without identity a live holder may still be starting its writer, so it fail-closes to unknown
- * instead; the wedge a dead session leaves behind still never outlives its TTL. A token from an earlier boot of this machine (its
+ * host-less expired token is reclaimed only on a reader that itself cannot derive identity
+ * (nowhere else can a host-less holder be placed inside the reader's PID namespace) and only
+ * once its holder pid is confirmed ESRCH-dead here; any other host-less expired verdict, and
+ * any inconclusive probe, fail-closes to unknown — on the identity-less reader (the platform
+ * such tokens come from) a dead session's orphan still never outlives its TTL. A token from an earlier boot of this machine (its
  * machine-stable identity matches, its boot-scoped identity does not) has no pid left to probe —
  * they died with that boot — so it expires into reclaimable stale instead of an unknown wedge;
  * a different machine, or a legacy token without the machine part, keeps the fail-closed unknown.
@@ -228,12 +247,18 @@ export function readLeaseVerdict(path: string, now: number = Date.now(), cwd?: s
 	// liveness without ever granting a dead verdict it cannot prove.
 	const provablyLocal = token.host !== undefined ? token.host === host : host === null;
 	if (token.expiresAt <= now) {
-		// A host-less expired token is reclaimed only once its holder pid is verifiably dead here
-		// (the writer checks above already cleared its writer): without identity the TTL alone
-		// cannot displace a holder that may still be starting its writer — on any host, identity
-		// or not — so a live holder fail-closes to unknown. The TTL still bounds the wedge: a
-		// dead holder's orphan never outlives it.
-		if (token.host === undefined) return processAlive(token.pid) ? "unknown" : "held-stale";
+		// A host-less expired token needs local PID provenance before its holder pid means
+		// anything: two PID namespaces can share one locks directory, and the only reader that
+		// can place a host-less holder in its own namespace is one of the identity-less kind the
+		// token came from (host === null). An identity-capable reader fail-closes to unknown
+		// whatever a local probe says, and within the provable scope only a confirmed ESRCH is
+		// death — an inconclusive lookup never marks the lease stale (the writer checks above
+		// already cleared its writer, and within this provable scope the TTL still bounds the
+		// wedge a dead session leaves).
+		if (token.host === undefined) {
+			if (!provablyLocal) return "unknown";
+			return pidLivenessHere(token.pid) === "dead" ? "held-stale" : "unknown";
+		}
 		if (provablyLocal) return "held-stale";
 		return "unknown";
 	}
@@ -278,19 +303,20 @@ function dropFile(file: string): void {
 	}
 }
 
-/** Puts a displaced record back at its path. A restore that loses to EEXIST proves a legitimate
- * contender retook the empty path mid-window, so the displaced record is superseded litter and
- * goes; any other failure (I/O, permission, a dangling reference) proves nothing about who owns
- * the path — the record stays beside it as a recoverable file (acquisition fail-closes beside a
- * live one) instead of being deleted out from under a holder that may still be starting its
- * writer. */
+/** Puts a displaced record back at its path. Every caller holds the per-path mutex, so a
+ * conforming session can never occupy the empty path here — a restore that loses to EEXIST met
+ * a publisher whose own section had already lost the mutex (its validations died with it), and
+ * any other failure (I/O, permission, a dangling reference) proves nothing about who owns the
+ * path either way: the record stays beside it as a recoverable file in both cases — the
+ * abandoned-record cleanup and the TTL bound how long it can sit there — instead of being
+ * deleted out from under a holder that may still be starting its writer. */
 function restoreDisplacedRecord(graveyard: string, path: string): void {
 	try {
 		linkSync(graveyard, path);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") return; // unexplained: keep the record recoverable
+	} catch {
+		return; // unexplained, or a publication landed in the window: either way, keep the record recoverable
 	}
-	dropFile(graveyard); // restored (the extra name goes) or superseded (a contender owns the path)
+	dropFile(graveyard); // restored: the extra name goes
 }
 
 /** Token records a displaced section left beside the path (`<name>.<uuid>.stale`): a section
@@ -336,8 +362,8 @@ function displacedRecordHolds(path: string, now: number, cwd?: string): boolean 
  * an adopter displaced past any of its checks loses cleanly instead of replacing a newer
  * owner's token. A publish that fails after the rename restores the displaced original
  * first, so a failed best-effort update leaves the original lease effective instead of
- * deleting it; when the restore itself fails without proving the path retaken, the displaced
- * record stays recoverable beside the path instead of being dropped.
+ * deleting it; when the restore itself fails — for any reason, a landed publication
+ * included — the displaced record stays recoverable beside the path instead of being dropped.
  */
 function adoptWriterPid(path: string, pid: number, proxy: boolean, now: number = Date.now(), nonce?: string): void {
 	withPathMutex(path, ADOPT_MUTEX_WAIT_MS, (owns) => {
@@ -620,12 +646,21 @@ function readNonce(path: string): string | undefined {
  * Creates the token exclusively and binds release to this acquisition's nonce. The read-back is
  * defense in depth against a doubly-stolen mutex: if the token at the path is not the one this
  * acquisition just wrote, a concurrent reclaimer raced past the serialization — yield the path
- * and remove nothing (the newer owner's token stays).
+ * and remove nothing (the newer owner's token stays). The publish is then re-examined against
+ * open rename-away windows: the section's earlier scan cannot see a window that opened after
+ * it (a section can stall between its scan and its publish link), so the scan repeats bound to
+ * the landed publication — one that landed beside a displaced record another section may still
+ * restore is reversed (nonce-fenced removal, so nothing else is touched) and the acquisition
+ * fails closed, because keeping it could hand one lease to two sessions.
  */
-function createLease(path: string, kind: LeaseKind, ttlMs: number, now: number): AcquiredLease | undefined {
+function createLease(path: string, kind: LeaseKind, ttlMs: number, now: number, cwd?: string): AcquiredLease | undefined {
 	const nonce = randomUUID();
 	if (!writeTokenExclusively(path, kind, ttlMs, now, nonce)) return undefined;
 	if (readNonce(path) !== nonce) return undefined;
+	if (displacedRecordHolds(path, now, cwd)) {
+		removeTokenRecord(path, nonce); // reverse this publication: never keep a lease beside an open window
+		return undefined;
+	}
 	return {
 		nonce,
 		release: () => releaseOwnToken(path, nonce),
@@ -638,9 +673,9 @@ function createLease(path: string, kind: LeaseKind, ttlMs: number, now: number):
  * check observed — enforced at the filesystem operation itself: the record is renamed out first,
  * and only a grabbed file whose nonce matches is deleted. A successor's token published after
  * that check (the checker stalled past its mutex and lease TTLs before acting) is restored with
- * a no-replace link, never deleted; one whose restore loses to a legitimately retaken path is
- * superseded litter, and a restore that fails for an unexplained reason keeps the record
- * recoverable beside the path. The restore cannot lose the path to a conforming session either — the
+ * a no-replace link, never deleted; a restore that fails — a landed publication or any
+ * unexplained failure — keeps the record recoverable beside the path. The restore cannot lose
+ * the path to a conforming session either — the
  * free-path acquisition serializes on the same per-path mutex, so a displaced live record is
  * never absent to acquisition while its section holds. A vanished path counts as removed:
  * nothing blocks the exclusive create.
@@ -710,7 +745,9 @@ export function tryAcquireLease(path: string, kind: LeaseKind, ttlMs: number, no
 	// and a displaced record another (since-displaced) section may still restore fail-closes
 	// the attempt, because publishing beside it could hand one lease to two sessions. The
 	// exclusive create still decides ownership; the mutex and the rechecks make those windows
-	// invisible or refused.
+	// invisible or refused, and a publication that still lands inside a window opened after
+	// its own scan (a section stalled mid-publish) reverses itself at the publish (see
+	// createLease) instead of surviving beside the record another section still owns.
 	return withPathMutex(path, mutexWaitMs, (owns): AcquiredLease | undefined => {
 		const recheck = readLeaseVerdict(path, now, cwd);
 		if (recheck !== "free" && recheck !== "held-stale") return undefined; // a writer or lease appeared while waiting, or a faster reclaimer owns it now
@@ -723,7 +760,7 @@ export function tryAcquireLease(path: string, kind: LeaseKind, ttlMs: number, no
 			if (!owns()) return undefined; // the mutex was replaced mid-section: never remove a newer owner's state
 			if (!removeTokenRecord(path, observed)) return undefined; // cannot clear exactly the stale token: do not write past it
 		}
-		return createLease(path, kind, ttlMs, now);
+		return createLease(path, kind, ttlMs, now, cwd);
 	});
 }
 
