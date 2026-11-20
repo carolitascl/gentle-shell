@@ -420,8 +420,10 @@ function unquoteAssignment(token: string): string {
 }
 
 /** A # begins a comment only at the start of a word: after start-of-input or any shell
- * metacharacter that ends a word. Mid-word (`echo a#b`) it is a literal character, exactly
- * as Bash reads it. */
+ * metacharacter that ends a word. Mid-word (`echo a#b`, or right after an escaped space —
+ * `cat foo\ #note` keeps the # inside the word) it is a literal character, exactly as Bash
+ * reads it. The passes below track the word start through their scan instead of testing the
+ * previous raw character, which cannot tell an escaped space from one that ends a word. */
 const COMMENT_WORD_BOUNDARY = /[\s;&|()<>]/;
 
 /**
@@ -438,6 +440,10 @@ const COMMENT_WORD_BOUNDARY = /[\s;&|()<>]/;
 function stripHeredocBodies(command: string): string {
 	let out = "";
 	let index = 0;
+	// Whether the next character starts a shell word — the state a comment's # needs,
+	// tracked through the scan instead of re-derived from the previous raw character: an
+	// escaped space (`cat foo\ #note`) does not end the word, so a # after it is a literal.
+	let wordStart = true;
 	while (index < command.length) {
 		const char = command[index];
 		if (char === "'" || char === '"') {
@@ -445,25 +451,31 @@ function stripHeredocBodies(command: string): string {
 			const end = close === -1 ? command.length : close + 1;
 			out += command.slice(index, end);
 			index = end;
+			wordStart = false;
 			continue;
 		}
 		if (char === "\\") {
 			out += command.slice(index, Math.min(index + 2, command.length));
 			index += 2;
+			// The escaped character is word content; a backslash-newline continuation is
+			// transparent instead — the word (or the empty input before it) keeps its state.
+			if (command[index - 1] !== "\n") wordStart = false;
 			continue;
 		}
-		if (char === "#" && (index === 0 || COMMENT_WORD_BOUNDARY.test(command[index - 1]))) {
+		if (char === "#" && wordStart) {
 			// A word-initial # comments out the rest of the line: its quotes and operators are
 			// comment text, so the line is copied whole and scanning resumes on the next line.
 			const lineEnd = command.indexOf("\n", index);
 			const end = lineEnd === -1 ? command.length : lineEnd + 1;
 			out += command.slice(index, end);
 			index = end;
+			wordStart = true;
 			continue;
 		}
 		if (char === "<" && command[index + 1] === "<" && command[index + 2] === "<") {
 			out += "<<<";
 			index += 3;
+			wordStart = true;
 			continue;
 		}
 		if (char === "<" && command[index + 1] === "<") {
@@ -478,6 +490,7 @@ function stripHeredocBodies(command: string): string {
 				// `<<` with no delimiter word: a syntax error, copied as plain content.
 				out += "<<";
 				index += 2;
+				wordStart = true;
 				continue;
 			}
 			out += command.slice(index, lineEnd + 1);
@@ -485,10 +498,12 @@ function stripHeredocBodies(command: string): string {
 			for (const delimiter of delimiters) {
 				index = endOfHeredocBody(command, index, delimiter);
 			}
+			wordStart = true;
 			continue;
 		}
 		out += char;
 		index += 1;
+		wordStart = COMMENT_WORD_BOUNDARY.test(char);
 	}
 	return out;
 }
@@ -509,20 +524,26 @@ interface HeredocDelimiter {
 function heredocDelimitersOnLine(command: string, from: number, lineEnd: number): HeredocDelimiter[] {
 	const delimiters: HeredocDelimiter[] = [];
 	let index = from;
+	// The same word-start state the outer passes track: a # after an escaped space is a
+	// literal inside the word, not the comment that would end the delimiter scan.
+	let wordStart = true;
 	while (index < lineEnd) {
 		const char = command[index];
-		if (char === "#" && COMMENT_WORD_BOUNDARY.test(command[index - 1])) return delimiters;
+		if (char === "#" && wordStart) return delimiters;
 		if (char === "'" || char === '"') {
 			const close = command.indexOf(char, index + 1);
 			index = close === -1 ? lineEnd : Math.min(close + 1, lineEnd);
+			wordStart = false;
 			continue;
 		}
 		if (char === "\\") {
+			if (command[index + 1] !== "\n") wordStart = false;
 			index += 2;
 			continue;
 		}
 		if (char === "<" && command[index + 1] === "<" && command[index + 2] === "<") {
 			index += 3;
+			wordStart = true;
 			continue;
 		}
 		if (char === "<" && command[index + 1] === "<") {
@@ -550,9 +571,11 @@ function heredocDelimitersOnLine(command: string, from: number, lineEnd: number)
 			}
 			delimiters.push({ word, stripTabs });
 			index = cursor;
+			wordStart = false;
 			continue;
 		}
 		index += 1;
+		wordStart = COMMENT_WORD_BOUNDARY.test(char);
 	}
 	return delimiters;
 }
@@ -590,6 +613,9 @@ function shellCommandList(command: string): string[] {
 	let quote: "'" | '"' | undefined;
 	let escaped = false;
 	let comment = false;
+	// The word-start state the comment boundary needs, tracked instead of re-derived from
+	// the last raw character: an escaped space keeps the word open, so a # after it is literal.
+	let wordStart = true;
 	for (const char of stripHeredocBodies(command)) {
 		// Comment text: a word-initial # runs to the end of the line, and only the newline
 		// that ends it still separates commands.
@@ -607,6 +633,7 @@ function shellCommandList(command: string): string[] {
 			if (char !== "\n") {
 				current += "\\";
 				current += char;
+				wordStart = false;
 			}
 			escaped = false;
 			continue;
@@ -623,11 +650,12 @@ function shellCommandList(command: string): string[] {
 		if (char === '"' || char === "'") {
 			quote = char;
 			current += char;
+			wordStart = false;
 			continue;
 		}
 		// A word-initial # comments out the rest of the line: quotes and separators inside
 		// the comment are text, and the comment's own newline still ends the command.
-		if (char === "#" && (current.length === 0 || COMMENT_WORD_BOUNDARY.test(current.slice(-1)))) {
+		if (char === "#" && wordStart) {
 			comment = true;
 			current += char;
 			continue;
@@ -635,9 +663,11 @@ function shellCommandList(command: string): string[] {
 		if (char === "\n" || char === ";" || char === "&" || char === "|") {
 			commands.push(current);
 			current = "";
+			wordStart = true;
 			continue;
 		}
 		current += char;
+		wordStart = COMMENT_WORD_BOUNDARY.test(char);
 	}
 	commands.push(current);
 	return commands.filter((part) => part.trim().length > 0);

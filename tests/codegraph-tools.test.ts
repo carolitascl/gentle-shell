@@ -7,7 +7,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { clearCodegraphResolveCache, resolveCodegraphEntry } from "../lib/codegraph-cli-resolve.ts";
+import { clearCodegraphResolveCache, resolveCodegraphShimState } from "../lib/codegraph-cli-resolve.ts";
 import { MAX_REPLY_CHARS, resetDaemonRegistryMemo, type DaemonCallResult } from "../lib/codegraph-daemon.ts";
 import type { InitLockOutcome } from "../lib/codegraph-lease.ts";
 import type { EnsureExposureIo } from "../lib/codegraph-mcp-exposure.ts";
@@ -1406,6 +1406,20 @@ test("the guard ignores here-document operators inside Bash comments", async (t)
 	assert.equal(verdict("echo foo#bar <<EOF\ncodegraph index .\nEOF"), undefined, "a # mid-word starts no comment: the here-document body stays the command's input");
 });
 
+test("the guard keeps an escaped space inside the word: # after it starts no comment", async (t) => {
+	const verdict = await guardOnIndexedWorkspace(t);
+	// Assembled from char codes: a backslash-before-space literal is corruption-prone in generated code.
+	const escapedSpace = String.fromCharCode(92) + " ";
+	const newline = String.fromCharCode(10);
+	// The escaped space keeps the word open, so the # after it is a literal argument and the
+	// <<'EOF' operator is real: the body's example rebuild is the command's input, never a command.
+	const escaped = verdict("cat foo" + escapedSpace + "#note <<'EOF'" + newline + "codegraph index ." + newline + "EOF");
+	assert.equal(escaped, undefined, "an escaped space is not a comment boundary: the here-document body stays data");
+	// The unescaped form is a real comment: its << opens nothing, so the next line's rebuild is a command.
+	const commented = verdict("cat foo #note <<'EOF'" + newline + "codegraph index ." + newline + "EOF") as { block?: boolean } | undefined;
+	assert.equal(commented?.block, true, "a real comment's operator opens nothing: the following rebuild runs and is blocked");
+});
+
 function writeCodeGraphPackage(binDir: string, scriptSource = "#!/usr/bin/env node\n"): string {
 	const pkgRoot = join(binDir, "node_modules", "@colbymchenry", "codegraph");
 	mkdirSync(pkgRoot, { recursive: true });
@@ -1637,9 +1651,9 @@ test("win32: a genuine miss keeps the cascade: no shim, no scan anchor, unavaila
 	withoutChildEnv(t);
 	const binDir = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-miss-bin-")));
 	t.after(() => rmSync(binDir, { recursive: true, force: true }));
-	// The package without its shim: no codegraph.cmd anywhere on PATH, so the resolution is
-	// a genuine miss (nothing was rejected) and the per-call scan keeps its turn, finding no
-	// anchor to expand.
+	// The package without its shim: no codegraph.cmd anywhere on the fixture PATH, so the
+	// resolution is a genuine miss (nothing was rejected) and the per-call scan keeps its
+	// turn, finding no anchor to expand.
 	writeCodeGraphPackage(binDir, "process.stdout.write(JSON.stringify(process.argv.slice(2)));\n");
 	rmSync(join(binDir, "codegraph.cmd"));
 	writePwdGitShim(binDir);
@@ -1648,7 +1662,21 @@ test("win32: a genuine miss keeps the cascade: no shim, no scan anchor, unavaila
 	withPlatform(t, "win32");
 	clearCodegraphResolveCache();
 	t.after(() => clearCodegraphResolveCache());
-	assert.equal(resolveCodegraphEntry(), null, "no shim on PATH resolves to nothing");
+	// The miss is asserted on an isolated PATH a developer's installed shim can never
+	// enter, so the assertion means the same thing on every host.
+	assert.equal(
+		resolveCodegraphShimState({ platform: () => "win32", pathEnv: () => binDir, exists: (path) => existsSync(path), read: (path) => readFileSync(path, "utf8") }).status,
+		"miss",
+		"no shim on the isolated PATH resolves to a miss",
+	);
+	// The exec seam records every spawn the cascade attempts without ever launching an
+	// executable a host PATH could still expose.
+	let attempts = 0;
+	const restoreExec = armCodegraphExecForTest((async () => {
+		attempts += 1;
+		throw Object.assign(new Error("spawn codegraph ENOENT"), { code: "ENOENT" });
+	}) as unknown as Parameters<typeof armCodegraphExecForTest>[0]);
+	t.after(restoreExec);
 
 	const result = await createCodeGraphTool(undefined, { initLock: lockAcquired }).execute(
 	"test",
@@ -1659,6 +1687,7 @@ test("win32: a genuine miss keeps the cascade: no shim, no scan anchor, unavaila
 	);
 	assert.match(result.content[0].text, /CodeGraph is unavailable/);
 	assert.equal((result.details as { status?: string }).status, "unavailable");
+	assert.ok(attempts >= 1, "the cascade did attempt its spawns; the armed seam launched nothing");
 });
 
 test("POSIX: a bare-codegraph ENOENT stays unavailable — no resolver consultation, no package scan", async (t) => {
