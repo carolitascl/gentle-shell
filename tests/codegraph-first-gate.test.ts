@@ -640,3 +640,41 @@ test("(z) a batch that mixes memory reads with an unrelated _query tool is not a
 		"a codegraph query in the batch still refuses the turn's memory reads",
 	);
 });
+
+test("(aa) a CLI query preceded by shell assignments credits like a plain invocation; quoted assignment text never does", (t) => {
+	const handlers = installGate(t);
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "tool_execution_start", { toolName: "grep", toolCallId: "aa-arm", args: { pattern: "symbol" } });
+	// Bash runs the query with the assignments as its environment: the executable is still
+	// codegraph, so the call is a graph execution start to end.
+	fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: "aa1", args: { command: "LC_ALL=C codegraph query symbol -p /worktree" } });
+	assert.deepEqual(
+		fire(handlers, "tool_call", { toolName: "mem_search" }),
+		{ block: true, reason: BLOCK_REASON },
+		"the assigned CLI query is a graph execution while it runs",
+	);
+	fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: "aa1" });
+	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search" }), undefined, "a finalized assigned CLI query credits the prompt");
+	// Several assignments, and an explore, behave the same.
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "tool_execution_start", { toolName: "grep", toolCallId: "aa-arm-2", args: { pattern: "symbol" } });
+	fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: "aa2", args: { command: "NO_COLOR=1 LANG=C.UTF-8 codegraph explore -p /worktree main" } });
+	fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: "aa2" });
+	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search" }), undefined, "an assigned CLI explore credits even when it failed");
+	// An assignment word that is not leading is an argument, not an environment prefix, and
+	// quoted text stays data - the separator inside the quotes included: neither runs codegraph.
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "tool_execution_start", { toolName: "grep", toolCallId: "aa-arm-3", args: { pattern: "symbol" } });
+	for (const [id, command] of [
+		["aa3", "echo LC_ALL=C codegraph query symbol"],
+		["aa4", "printf '%s\\n' 'note; LC_ALL=C codegraph query symbol'"],
+	] as const) {
+		fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: id, args: { command } });
+		fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: id });
+		assert.deepEqual(
+			fire(handlers, "tool_call", { toolName: "mem_search" }),
+			{ block: true, reason: BLOCK_REASON },
+			`${id} never credits: no executable codegraph invocation`,
+		);
+	}
+});

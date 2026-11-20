@@ -21,14 +21,98 @@ const MEMORY_GATE_OVERRIDE = "GENTLE_CODEGRAPH_MEMORY_GATE";
 const SEARCH_COMMAND_SNIFF = /\b(?:rg|grep|fd|find|ag|ack)\b/;
 
 /**
- * The bash-command sniff for the CLI query workflow AGENTS.md credits: codegraph query or
- * codegraph explore in an executable command position - the start of the command or after a
- * command separator (;, &, |, (, or a newline) - with any arguments (the worktree-dispatch
- * form carries -p). Quoted command text is not an execution: printf '%s\n' 'codegraph query
- * symbol' passes the string as data, so the sniff must not match it. init, status, and every
- * other subcommand never match either.
+ * Replaces every quoted span and escaped character of a bash command string with a neutral
+ * filler character (NUL): quoted text and escapes are data, never syntax, so no separator,
+ * operator, or command word inside them can be read as an execution. Length and every
+ * unquoted character's position are preserved, so the command's structure outside quotes
+ * stays exactly where it was.
  */
-const CLI_QUERY_SNIFF = /(?:^|[;&|(\n])\s*codegraph\s+(?:query|explore)\b/;
+function maskQuotedCommandText(command: string): string {
+	const filler = "\u0000";
+	let masked = "";
+	let quote = "";
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i]!;
+		if (quote === "'") {
+			masked += filler;
+			if (ch === "'") quote = "";
+		} else if (quote === '"') {
+			masked += filler;
+			if (ch === "\\") {
+				i++;
+				masked += filler;
+			} else if (ch === '"') {
+				quote = "";
+			}
+		} else if (ch === "'" || ch === '"') {
+			quote = ch;
+			masked += filler;
+		} else if (ch === "\\") {
+			i++;
+			masked += filler + filler;
+		} else {
+			masked += ch;
+		}
+	}
+	return masked;
+}
+
+/** A word bash accepts as a temporary environment assignment (NAME=VALUE) ahead of the
+ * command it applies to; the value side is whatever one unquoted word can hold. */
+const ASSIGNMENT_WORD = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * The quote-aware command analysis behind the CLI query workflow AGENTS.md credits: whether a
+ * bash command string runs `codegraph query` or `codegraph explore` in an executable command
+ * position - the command's start, or after ;, &, |, (, ), or a newline. Quoted text is masked
+ * to filler first, so a separator or command word inside quotes - printf '%s\n' 'note;
+ * LC_ALL=C codegraph query' - is never an execution. At each command position, leading
+ * NAME=VALUE assignments are skipped (LC_ALL=C codegraph query ... runs the query); init,
+ * status, and every other subcommand never match.
+ */
+function isCliQueryCommand(command: string): boolean {
+	const masked = maskQuotedCommandText(command);
+	let present = false;
+	const words: Array<{ text: string; quoted: boolean }> = [];
+	let word = "";
+	const endWord = () => {
+		if (word !== "") words.push({ text: word, quoted: word.includes("\u0000") });
+		word = "";
+	};
+	/** Whether the words of one finished simple command put codegraph query or explore in the
+	 * executable position, leading unquoted assignments skipped: they are the command's
+	 * environment, not its executable. */
+	const creditSegment = () => {
+		if (words.length === 0) return;
+		let at = 0;
+		while (at < words.length && !words[at]!.quoted && ASSIGNMENT_WORD.test(words[at]!.text)) at++;
+		const executable = words[at];
+		const subcommand = words[at + 1];
+		if (
+			executable !== undefined && !executable.quoted && executable.text === "codegraph" &&
+			subcommand !== undefined && !subcommand.quoted && (subcommand.text === "query" || subcommand.text === "explore")
+		) {
+			present = true;
+		}
+		words.length = 0;
+	};
+	for (let i = 0; i < masked.length; i++) {
+		const ch = masked[i]!;
+		if (ch === "\u0000") {
+			word += ch;
+		} else if (ch === " " || ch === "\t" || ch === "\r") {
+			endWord();
+		} else if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === ")" || ch === "\n") {
+			endWord();
+			creditSegment();
+		} else {
+			word += ch;
+		}
+	}
+	endWord();
+	creditSegment();
+	return present;
+}
 
 /**
  * Whether the Memory ordering gate applies to the workspace a memory read runs in: only a
@@ -58,8 +142,10 @@ function gateApplies(cwd: unknown): boolean {
  * command naming rg, grep, fd, find, ag or ack — until a codegraph query or explore has
  * finalized in the same user prompt; a graph execution in flight blocks memory reads
  * regardless, so a read never interleaves a live graph call. The CLI query workflow (a
- * bash-run codegraph query or explore) counts as that query or explore, start to end. The
- * gate is also batch-aware: an assistant turn whose tool batch mixes a memory read with a
+ * bash-run codegraph query or explore) counts as that query or explore, start to end:
+ * quoted command text is data, never an execution, while leading shell assignments still
+ * identify the executable. The gate is also batch-aware: an assistant turn whose tool batch
+ * mixes a memory read with a
  * graph query or explore never admits the memory read, whichever position lists it — a
  * batch's admitted calls run concurrently, so order inside it cannot satisfy the rule. A prompt with no workspace
  * search is never gated: its memory reads pass with zero graph involvement. The requested
@@ -116,7 +202,7 @@ export default function codegraphFirstGate(pi: ExtensionAPI): void {
 		if (typeof name !== "string") return false;
 		if (isGraphToolName(name) && isQueryOrExplore(name, args)) return true;
 		const command = (args as { command?: unknown } | undefined | null)?.command;
-		return name === "bash" && typeof command === "string" && CLI_QUERY_SNIFF.test(command);
+		return name === "bash" && typeof command === "string" && isCliQueryCommand(command);
 	};
 
 	/** The whole tool batch of one assistant turn, read from the turn's own message: Pi
@@ -199,7 +285,7 @@ export default function codegraphFirstGate(pi: ExtensionAPI): void {
 					// A CLI query or explore through bash is the graph execution AGENTS.md credits for
 					// worktree dispatches: active from its start, credited at its end like any other,
 					// and never for init, status, or another subcommand.
-					if (CLI_QUERY_SNIFF.test(command) && typeof toolCallId === "string") {
+					if (isCliQueryCommand(command) && typeof toolCallId === "string") {
 						activeGraphExecutions.add(toolCallId);
 						queryExploreExecutions.add(toolCallId);
 					}
