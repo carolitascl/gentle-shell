@@ -6,7 +6,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { daemonFor, daemonHealth, exploreViaDaemon, liveDaemons, mcpLineReader, mcpReplyKind, parseMcpReply, registeredDaemons, resetDaemonRegistryMemo, setPipeProbeForTests, socketPresent } from "../lib/codegraph-daemon.ts";
+import { connectProbe, daemonFor, daemonHealth, exploreViaDaemon, liveDaemons, mcpLineReader, mcpReplyKind, parseMcpReply, registeredDaemons, resetDaemonRegistryMemo, setPipeProbeForTests, socketPresent } from "../lib/codegraph-daemon.ts";
 import type { McpReply, PipeProbeOutcome } from "../lib/codegraph-daemon.ts";
 import { canonicalRoot } from "../lib/codegraph-canonical.ts";
 
@@ -170,6 +170,28 @@ test("daemonHealth checks older candidates before declaring the project daemon w
 	await silent.ready;
 	await older.ready;
 	assert.equal(await daemonHealth(project, registryDir, 50), "ok", "the newest is silent but the older daemon still serves, so the project is not wedged");
+});
+
+test("daemonHealth starts the shared probe deadline before socket discovery", async (t) => {
+	// On Windows every uncached or inconclusive pipe probe can spend 250ms, so discovery must run
+	// inside the caller's health budget, not before it starts: the probe discovery spends carries
+	// the leftover of the one shared deadline, never a fresh full budget.
+	const project = dir(t, "health-deadline");
+	const registry = dir(t, "health-deadline-registry");
+	writeFileSync(join(registry, "record.json"), JSON.stringify({ root: project, socketPath: namedPipe("gentle-shell-health-deadline"), startedAt: 1, pid: process.pid }));
+	const seen: Array<{ path: string; timeoutMs: number }> = [];
+	setPipeProbeForTests((path, timeoutMs) => {
+		seen.push({ path, timeoutMs });
+		return "open";
+	});
+	t.after(() => setPipeProbeForTests(undefined));
+	const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+	Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+	t.after(() => Object.defineProperty(process, "platform", platformDescriptor));
+	await daemonHealth(project, registry, 50, 200);
+	assert.deepEqual(seen.map((probe) => probe.path), [namedPipe("gentle-shell-health-deadline")], "discovery probed the daemon's own pipe");
+	const probe = seen[0];
+	assert.ok(probe !== undefined && probe.timeoutMs > 0 && probe.timeoutMs <= 200, "discovery's probe spent the shared health budget, never a fresh 250ms one");
 });
 
 test("null and other non-object JSON replies never reach dispatch on either transport", async (t) => {
@@ -422,9 +444,16 @@ test("the real probe worker settles through the shared cell on both outcomes", a
 		return new Promise<void>((resolve) => server.close(() => resolve())).then(() => rmSync(join(home, pipe), { force: true }));
 	});
 	await listening;
-	assert.equal(socketPresent(pipe, "win32"), true, "the worker's connect lands in the shared cell and wakes the waiter as open");
+	// The raw worker outcomes are asserted directly with a test-controlled budget: a worker that
+	// misses a fixed 250ms budget answers inconclusive, and socketPresent maps inconclusive to
+	// present, so the mapped answer alone would pass or fail vacuously on a slow runner.
+	assert.equal(connectProbe(pipe, 2_000), "open", "the worker's connect lands in the shared cell and wakes the waiter as open");
 	const absent = namedPipe(`a-${randomUUID().slice(0, 8)}`);
-	assert.equal(socketPresent(absent, "win32"), false, "a pipe name with no listener is a clean refusal, not an inconclusive one");
+	assert.equal(connectProbe(absent, 2_000), "refused", "a pipe name with no listener is a clean refusal, not an inconclusive one");
+	// The mapped contract stays fail-safe on top of the raw outcomes: an open pipe is present, and
+	// a worker that misses its budget is inconclusive — still present, never a false absence; the
+	// refusal-to-absent mapping is pinned by the fake-probe tests above.
+	assert.equal(socketPresent(pipe, "win32"), true, "the mapped open answer stays present");
 });
 
 test("socketPresent spends a caller's deadline instead of the full probe budget", (t) => {
@@ -437,7 +466,12 @@ test("socketPresent spends a caller's deadline instead of the full probe budget"
 	t.after(() => setPipeProbeForTests(undefined));
 	assert.equal(socketPresent(pipe, "win32", Date.now() - 1), true, "a spent deadline skips the probe; inconclusive still counts as present");
 	assert.deepEqual(seen, [], "no probe runs once the deadline is gone");
-	assert.equal(socketPresent(pipe, "win32", Date.now() + 20), true, "a shrunken budget still probes fail-safe");
+	// The clock is held fixed across the deadline setup and the call: a scheduling pause between
+	// the two Date.now reads must not decide this assertion — the probe budget is the leftover the
+	// caller handed in, never whatever the host scheduler happened to leave.
+	const now = Date.now();
+	t.mock.method(Date, "now", () => now);
+	assert.equal(socketPresent(pipe, "win32", now + 20), true, "a shrunken budget still probes fail-safe");
 	assert.equal(seen.length, 1, "the leftover budget bought exactly one probe");
 	const probe = seen[0];
 	assert.ok(probe !== undefined && probe.timeoutMs > 0 && probe.timeoutMs <= 20, "the probe got the leftover, never the full 250ms");
@@ -485,4 +519,21 @@ test("mcpLineReader applies the frame cap to the raw remainder on the partial pa
 	const flood = mcpLineReader(() => false, 9);
 	assert.equal(flood(" ".repeat(5)), false, "whitespace accumulates across chunks while it fits the cap");
 	assert.equal(flood(" ".repeat(5)), true, "the raw cap stops the accumulation once it does not");
+});
+
+test("mcpLineReader applies one frame measure whether the newline shares the chunk or follows it", () => {
+	const replies: Array<McpReply | undefined> = [];
+	const read = mcpLineReader((message) => {
+		replies.push(message);
+		return false;
+	}, 9);
+	// The same padded reply in both chunk layouts: separator whitespace is not frame content, so
+	// a frame whose trimmed content fits the cap dispatches identically whether its newline arrived
+	// with the frame or follows separately — a raw remainder measure rejects only the split one.
+	assert.equal(read('{"id":2}  \n'), false, "the padded frame under the cap passes in one chunk");
+	assert.deepEqual(replies, [{ id: 2 }], "the padded reply reached dispatch");
+	replies.length = 0;
+	assert.equal(read('{"id":2}  '), false, "the same padded frame is buffered while its newline is pending");
+	assert.equal(read("\n"), false, "and dispatches when the newline follows separately");
+	assert.deepEqual(replies, [{ id: 2 }], "the split arrival dispatches the same padded frame");
 });

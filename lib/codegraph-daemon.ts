@@ -123,8 +123,9 @@ setTimeout(() => {
 /** One probe of the daemon's own pipe: a worker owns the event loop the async connect needs while
  * this thread waits on the shared cell for the outcome or the deadline, so the check answers within
  * the probe budget instead of enumerating every named pipe on the machine. A worker that never
- * starts or never reports is inconclusive, never absent. */
-function connectProbe(pipePath: string, timeoutMs: number): PipeProbeOutcome {
+ * starts or never reports is inconclusive, never absent. Exported for the real-worker tests, which
+ * assert the raw outcome before socketPresent maps it; production reaches it only through pipeProbe. */
+export function connectProbe(pipePath: string, timeoutMs: number): PipeProbeOutcome {
 	const state = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 	try {
 		const worker = new Worker(PROBE_WORKER_SOURCE, { eval: true, workerData: { pipePath, timeoutMs, state } });
@@ -285,8 +286,9 @@ export function mcpReplyKind(message: McpReply): McpReplyKind | undefined {
  * decides what that means. A truthy return from `onReply` stops the scan for the rest of the chunk, the
  * data handler's `return`. The chunk handler itself answers true when one frame grew past
  * `maxBufferChars` — a complete line past it in trimmed content, the unfinished remainder past it
- * in raw size — the runaway guard the socket conversation finishes on; a frame just under the cap
- * keeps its reply even when blank lines pad out the chunk that carried it.
+ * in trimmed content or in surrounding whitespace alone — the runaway guard the socket
+ * conversation finishes on; a frame just under the cap keeps its reply even when blank lines pad
+ * out the chunk that carried it.
  */
 export function mcpLineReader(onReply: (message: McpReply | undefined) => boolean | void, maxBufferChars: number = Number.POSITIVE_INFINITY): (chunk: string | Buffer) => boolean {
 	let buffer = "";
@@ -296,12 +298,14 @@ export function mcpLineReader(onReply: (message: McpReply | undefined) => boolea
 	const decoder = new StringDecoder("utf8");
 	return (chunk: string | Buffer) => {
 		buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
-		// The cap measures each frame on its own, and each side of the newline takes the measure that
-		// bounds its own cost: a complete reply is measured on trimmed content — one just under the
-		// cap is read even when its chunk carries trailing blank lines — while the unfinished
-		// remainder is measured on its raw size, because the buffer itself is the memory the cap
-		// guards: whitespace with no newline to trim it against cannot grow it past the limit. One
-		// oversized frame, complete or partial, is the runaway the guard answers true for.
+		// The cap measures each frame on its own with one size rule regardless of chunk boundaries:
+		// a frame's size is its trimmed content, so a padded frame just under the cap dispatches
+		// identically whether its newline arrived with the frame or follows separately. The
+		// whitespace around the unfinished remainder is still not free memory — the buffer itself
+		// is what the cap guards — so a remainder whose surrounding whitespace alone crosses the
+		// cap answers overflow, keeping the raw buffer bounded while the newline is pending. One
+		// oversized frame, complete or partial, is the runaway the guard answers true for, and
+		// separate blank lines belong to no frame and never count toward any limit.
 		let newline: number;
 		while ((newline = buffer.indexOf("\n")) >= 0) {
 			const line = buffer.slice(0, newline).trim();
@@ -310,7 +314,8 @@ export function mcpLineReader(onReply: (message: McpReply | undefined) => boolea
 			if (line.length === 0) continue;
 			if (onReply(parseMcpReply(line))) return false;
 		}
-		return buffer.length > maxBufferChars;
+		const content = buffer.trim();
+		return content.length > maxBufferChars || buffer.length - content.length > maxBufferChars;
 	};
 }
 
@@ -413,11 +418,14 @@ export type DaemonHealth = "ok" | "wedged" | "unreachable";
  */
 export async function daemonHealth(cwd: string, registryDir?: string, helloTimeoutMs: number = DAEMON_HELLO_TIMEOUT_MS, probeTimeoutMs: number = 5_000): Promise<DaemonHealth> {
 	try {
-		const sockets = daemonSockets(cwd, registryDir);
+		// The one probe deadline starts before discovery: each uncached or inconclusive pipe probe
+		// inside it can spend 250ms, and the gate must not wait for discovery and then the full
+		// health budget — the same deadline flow exploreViaDaemon gives its discovery.
+		const deadline = Date.now() + probeTimeoutMs;
+		const sockets = daemonSockets(cwd, registryDir, deadline);
 		if (sockets.length === 0) return "unreachable";
 		// Every candidate shares the one probe deadline, and an older daemon answers for a silent
 		// newest one before the gate calls the project wedged — the same fallback a search gets.
-		const deadline = Date.now() + probeTimeoutMs;
 		let wedged = false;
 		for (const socketPath of sockets) {
 			const remaining = deadline - Date.now();
