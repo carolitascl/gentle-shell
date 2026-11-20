@@ -194,6 +194,41 @@ test("daemonHealth starts the shared probe deadline before socket discovery", as
 	assert.ok(probe !== undefined && probe.timeoutMs > 0 && probe.timeoutMs <= 200, "discovery's probe spent the shared health budget, never a fresh 250ms one");
 });
 
+test("daemonHealth queries the newest daemon before probing an older candidate", async (t) => {
+	// Bulk discovery probed every candidate before the first query, so on Windows an older pipe's
+	// probe could spend the whole shared deadline and the gate answered unreachable without ever
+	// asking the healthy newest daemon — warm-up then spawned a second daemon for a project the
+	// newest one already served. The clock moves only inside the older pipe's probe, so exactly
+	// that probe decides the deadline is spent; the newest daemon is a plain socket file here and
+	// the platform mock routes only the older record's pipe-shaped path through the probe layer.
+	const project = dir(t, "health-interleave");
+	const registry = dir(t, "health-interleave-registry");
+	const healthy = fakeDaemon(t, project, HELLO, INITIALIZED, ANSWER, { registryDir: registry, recordName: "newest.json", startedAt: 2 });
+	await healthy.ready;
+	const olderPipe = namedPipe("gentle-shell-health-interleave-old");
+	writeFileSync(join(registry, "older.json"), JSON.stringify({ root: project, socketPath: olderPipe, startedAt: 1, pid: process.pid }));
+	const realNow = Date.now;
+	let offset = 0;
+	const probed: string[] = [];
+	t.mock.method(Date, "now", () => realNow() + offset);
+	setPipeProbeForTests((path) => {
+		if (path !== olderPipe) return "open";
+		probed.push(path);
+		// The older pipe's probe burns the rest of the budget, like a pipe that never answers.
+		offset = 10_000;
+		return "inconclusive";
+	});
+	const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+	Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+	t.after(() => {
+		setPipeProbeForTests(undefined);
+		Object.defineProperty(process, "platform", platformDescriptor);
+	});
+	assert.equal(await daemonHealth(project, registry, 50, 200), "ok", "the newest daemon answered before the older pipe's probe spent the budget");
+	assert.equal(healthy.connections(), 1, "the gate really asked the newest daemon");
+	assert.deepEqual(probed, [], "the older candidate was never probed once the newest daemon answered");
+});
+
 test("null and other non-object JSON replies never reach dispatch on either transport", async (t) => {
 	// JSON.parse accepts null, numbers, strings, arrays and booleans too; reading .codegraph or .id on
 	// null throws outside every conversation's error handling, so only a reply object may leave the parser.

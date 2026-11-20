@@ -23,7 +23,7 @@ interface RegisteredDaemon {
 	pid?: number;
 }
 
-/** One query can trigger several registry scans (daemonFor, daemonSockets, one per daemon attempt), so one read per project per window suffices. */
+/** One query can trigger several registry scans (daemonFor, liveDaemonSockets, one per daemon attempt), so one read per project per window suffices. */
 const REGISTRY_MEMO_MS = 1_000;
 let registryMemo: { key: string; at: number; daemons: RegisteredDaemon[] } | undefined;
 
@@ -32,7 +32,7 @@ export function resetDaemonRegistryMemo(): void {
 	registryMemo = undefined;
 }
 
-/** Exported for the tests that read the registry directly; daemonFor and daemonSockets call it in production. */
+/** Exported for the tests that read the registry directly; daemonFor and liveDaemonSockets call it in production. */
 /** Daemons registered for `root` in any spelling, newest first. Reads the registry only; starts nothing.
  * The platform picks the fold: on win32 both spellings compare through the process-lifetime canonical memo. */
 export function registeredDaemons(root: string, registryDir: string = join(homedir(), ".codegraph", "daemons"), platform: NodeJS.Platform = process.platform): RegisteredDaemon[] {
@@ -183,10 +183,15 @@ export interface DaemonInfo {
 	root?: string;
 }
 
+/** One registry record is a live daemon when its holder still runs and its socket is still there. */
+function daemonIsLive(entry: RegisteredDaemon, platform: NodeJS.Platform, deadlineAt?: number): boolean {
+	return entry.pid !== undefined && processAlive(entry.pid) && socketPresent(entry.socketPath, platform, deadlineAt);
+}
+
 /** The project's daemons that are still there — pid alive, socket present — newest first. An
  * optional deadline bounds the pipe probes the presence check may spend. */
 export function liveDaemons(cwd: string, registryDir?: string, platform: NodeJS.Platform = process.platform, deadlineAt?: number): RegisteredDaemon[] {
-	return registeredDaemons(cwd, registryDir, platform).filter((entry) => entry.pid !== undefined && processAlive(entry.pid) && socketPresent(entry.socketPath, platform, deadlineAt));
+	return registeredDaemons(cwd, registryDir, platform).filter((entry) => daemonIsLive(entry, platform, deadlineAt));
 }
 
 /** The project's newest daemon from CodeGraph's own registry. Reads only; starts nothing. */
@@ -201,9 +206,13 @@ export function projectSpelling(daemon: DaemonInfo | undefined, cwd: string): st
 	return daemon?.root ?? realpathSync(cwd);
 }
 
-/** Sockets of the project's live daemons, newest first; an optional deadline bounds the discovery probes. */
-function daemonSockets(cwd: string, registryDir?: string, deadlineAt?: number): string[] {
-	return liveDaemons(cwd, registryDir, undefined, deadlineAt).map((entry) => entry.socketPath);
+/** The project's live daemon sockets, newest first, discovered one candidate at a time: each pipe
+ * probe runs only when the walk reaches that candidate, so a daemon is queried before an older
+ * candidate's probe can spend the shared deadline. An optional deadline bounds each probe. */
+function* liveDaemonSockets(cwd: string, registryDir: string | undefined, deadlineAt?: number): Generator<string> {
+	for (const entry of registeredDaemons(cwd, registryDir)) {
+		if (daemonIsLive(entry, process.platform, deadlineAt)) yield entry.socketPath;
+	}
 }
 
 export type DaemonCallResult =
@@ -369,9 +378,10 @@ function ask(socketPath: string, tool: string, args: Record<string, unknown>, ti
 /**
  * Runs one CodeGraph MCP tool call through a daemon already serving `root`, the same text the CLI
  * prints but without a process of its own. It only reads the daemon registry and connects: it never
- * starts a daemon, and never throws. A silent daemon hands the rest of the budget to the next one,
- * and the budget covers discovery too: its pipe probes shrink to the leftover and no socket opens
- * once the deadline is spent.
+ * starts a daemon, and never throws. Candidates are discovered and queried one at a time, so a
+ * daemon is asked before the next candidate's pipe probe can spend the budget; a silent daemon
+ * hands the rest of the budget to the next one, and the budget covers discovery too: its pipe
+ * probes shrink to the leftover and no socket opens once the deadline is spent.
  */
 export async function exploreViaDaemon(
 	root: string,
@@ -384,7 +394,7 @@ export async function exploreViaDaemon(
 	try {
 		const deadline = Date.now() + timeoutMs;
 		let silent = false;
-		for (const socketPath of daemonSockets(root, registryDir, deadline)) {
+		for (const socketPath of liveDaemonSockets(root, registryDir, deadline)) {
 			// Discovery and every earlier attempt already spent part of the budget; a spent deadline
 			// opens no socket, because ask's own clamp would otherwise buy one more attempt.
 			const remaining = deadline - Date.now();
@@ -413,8 +423,10 @@ export type DaemonHealth = "ok" | "wedged" | "unreachable";
  * registry check — pid running, socket present, connections accepted — and still never answer,
  * so the gate asks the live daemons one real query each (the same call the stdio warm-up makes),
  * newest first within one probe deadline, and maps the answer: ok serves, silent or timeout is
- * wedged (the daemon holds its lock and cannot serve), unavailable has nothing to talk to. Reads
- * and connects only: it never starts anything, kills nothing, and never throws.
+ * wedged (the daemon holds its lock and cannot serve), unavailable has nothing to talk to. Each
+ * candidate is discovered only when its turn comes, so an older daemon's pipe probe cannot spend
+ * the budget before the newest daemon is queried. Reads and connects only: it never starts
+ * anything, kills nothing, and never throws.
  */
 export async function daemonHealth(cwd: string, registryDir?: string, helloTimeoutMs: number = DAEMON_HELLO_TIMEOUT_MS, probeTimeoutMs: number = 5_000): Promise<DaemonHealth> {
 	try {
@@ -422,12 +434,12 @@ export async function daemonHealth(cwd: string, registryDir?: string, helloTimeo
 		// inside it can spend 250ms, and the gate must not wait for discovery and then the full
 		// health budget — the same deadline flow exploreViaDaemon gives its discovery.
 		const deadline = Date.now() + probeTimeoutMs;
-		const sockets = daemonSockets(cwd, registryDir, deadline);
-		if (sockets.length === 0) return "unreachable";
-		// Every candidate shares the one probe deadline, and an older daemon answers for a silent
-		// newest one before the gate calls the project wedged — the same fallback a search gets.
+		// Candidates are discovered one at a time inside the same loop that queries them: the newest
+		// daemon is asked before an older candidate's pipe probe can spend the leftover, and an
+		// older daemon answers for a silent newest one before the gate calls the project wedged —
+		// the same fallback a search gets.
 		let wedged = false;
-		for (const socketPath of sockets) {
+		for (const socketPath of liveDaemonSockets(cwd, registryDir, deadline)) {
 			const remaining = deadline - Date.now();
 			if (remaining <= 0) break;
 			const outcome = await ask(socketPath, "codegraph_explore", { query: "main" }, remaining, helloTimeoutMs);
