@@ -725,6 +725,13 @@ function shellCommandList(command: string): ShellListCommand[] {
 			continue;
 		}
 		if (char === "\n" || char === ";" || char === "&" || char === "|") {
+			// An adjacent |& is one pipeline separator that pipes stderr as well: the & following
+			// an unquoted | with no command between them continues the pipeline instead of
+			// starting a background command of its own.
+			if (char === "&" && current === "" && operator === "|") {
+				operator = "|&";
+				continue;
+			}
 			commands.push({ text: current, operator });
 			// A doubled & or | is one operator (`&&`, `||`), never two separators — but only
 			// when the two characters are adjacent in the input: a command between them means
@@ -750,7 +757,12 @@ function shellCommandList(command: string): ShellListCommand[] {
  * on an unrelated earlier command) and its verb, on which the CLI's own target rules key.
  * Every executable command is inspected, not only the first: `cd . && codegraph index .`
  * rebuilds as surely as a bare `codegraph index .`. The word boundary keeps every other
- * subcommand (`codegraph indexer`, `sync`, `query`, `unlock`, `status`) out. Each rebuild also carries the directories its position in the list can run in: every `cd` the list can follow moves them on the path where it succeeds while a failed one leaves them untouched, conditional branches are followed per outcome, and any form that can move the working directory unseen leaves them unresolvable.
+ * subcommand (`codegraph indexer`, `sync`, `query`, `unlock`, `status`) out. Each rebuild also
+ * carries the directories its position in the list can run in, one per path this walk still
+ * follows: every `cd` the list can follow moves them on the path where it succeeds while a
+ * failed one leaves them untouched, conditional branches keep both outcomes with the status
+ * each left behind, a pipeline decides reachability once for all of its stages, and any form
+ * that can move the working directory unseen leaves them unresolvable.
  */
 /** The directory after one `cd` command a flat list can follow: exactly one literal
  * argument — quote removal applied, no variable, tilde, or substitution, no extra words
@@ -784,15 +796,36 @@ interface RebuildCommand {
 	cwds: ReadonlyArray<CwdPath>;
 }
 
-/** A list that keeps branching past this many live directories is no longer a walk this guard
- * can place commands in: one unresolvable entry stands for every directory it could reach. */
-const MAX_TRACKED_DIRS = 4;
+/** One state the shell can be in at a position of the list: the directory it is in, and the
+ * status its last executed command left - which decides whether the following `&&` or `||`
+ * branch runs. A command the shell provably skips leaves the state exactly as it was. */
+interface CwdState {
+	dir: CwdPath;
+	verdict: boolean | undefined;
+}
 
-/** The directories both branch outcomes reach, without duplicates: an unconditional separator
- * runs the next command whatever the previous status was, so both paths stay live. */
-function unionDirs(branched: ReadonlyArray<CwdPath>, other: ReadonlyArray<CwdPath>): CwdPath[] {
-	const merged = [...branched, ...other].filter((dir, index, all) => all.indexOf(dir) === index);
-	return merged.length > MAX_TRACKED_DIRS ? [undefined] : merged;
+/** A list that keeps branching past this many live states is no longer a walk this guard can
+ * place commands in: one unresolvable entry stands for every state it could reach. */
+const MAX_TRACKED_STATES = 4;
+
+/** Records one live state, without duplicates: two paths that reach the same directory with the
+ * same status are one state, and past {@link MAX_TRACKED_STATES} branches the walk can no longer
+ * name them, so one unknown entry stands for every state the list could reach. */
+function addState(states: CwdState[], state: CwdState): void {
+	if (states.some((one) => one.dir === state.dir && one.verdict === state.verdict)) return;
+	states.push(state);
+	if (states.length > MAX_TRACKED_STATES) states.splice(0, states.length, { dir: undefined, verdict: undefined });
+}
+
+/** Whether an operator joins two stages of one pipeline: `|` and `|&` both keep the pipeline
+ * alive, while every other separator starts a new one. */
+function isPipelineOperator(operator: string): boolean {
+	return operator === "|" || operator === "|&";
+}
+
+/** Whether one command of a list is a `cd`: the word alone, or followed by its arguments. */
+function isCdCommand(rest: string): boolean {
+	return rest === "cd" || rest.startsWith("cd ") || rest.startsWith("cd\t");
 }
 
 /** Commands that can move the working directory outside a literal `cd`: a leading
@@ -834,61 +867,73 @@ function codegraphIndexCommands(command: string, startCwd: string): RebuildComma
 	const rebuilds: RebuildCommand[] = [];
 	const parts = shellCommandList(command);
 	const stageStatuses = parts.map((part) => staticExitStatus(leadingAssignments(part.text).rest));
-	// The status the list carries after each command, after folding every pipeline it belongs
-	// to: only a pipeline's last stage holds the group's status, and only stages that agree
-	// prove it — a later stage's success alone never stands for a pipeline whose earlier stage
-	// may have failed under pipefail.
-	const listStatus: Array<boolean | undefined> = [];
+	// The pipelines of the list, each with the operator that introduced it and the status it
+	// certainly reports: a stage joined by | or |& belongs to the pipeline before it, and the
+	// shell reaches, skips, or reports the group as one - a later stage's success alone never
+	// stands for a pipeline whose earlier stage may have failed under pipefail.
+	const pipelines: Array<{ operator: string; stages: string[]; status: boolean | undefined }> = [];
 	for (let index = 0; index < parts.length;) {
 		const start = index;
-		while (index + 1 < parts.length && (parts[index + 1]!.operator === "|" || parts[index + 1]!.operator === "|&")) index += 1;
-		const groupStatus = pipelineExitStatus(stageStatuses.slice(start, index + 1));
-		for (let stage = start; stage <= index; stage += 1) listStatus.push(stage === index ? groupStatus : undefined);
+		while (index + 1 < parts.length && isPipelineOperator(parts[index + 1]!.operator)) index += 1;
+		pipelines.push({
+			operator: parts[start]!.operator,
+			stages: parts.slice(start, index + 1).map((part) => part.text),
+			status: pipelineExitStatus(stageStatuses.slice(start, index + 1)),
+		});
 		index += 1;
 	}
-	// The directories the shell can be in when the next command runs, kept per branch outcome:
-	// a success leaves it in one set, a failure in the other, and the next command's operator
-	// picks the set its own branch really runs in. Both start at the caller's cwd.
-	let successDirs: CwdPath[] = [startCwd];
-	let failureDirs: CwdPath[] = [startCwd];
-	// Whether the previous command certainly succeeded or failed, so a conditional branch
-	// is known; undefined when the shell's path through the list cannot be evaluated here.
-	let previousVerdict: boolean | undefined = true;
-	for (let index = 0; index < parts.length; index += 1) {
-		const part = parts[index]!;
-		const parsed = leadingAssignments(part.text);
-		// A branch the shell provably skips runs nothing: it moves no directory, rebuilds no
-		// index, and leaves the last executed status in place for the commands after it —
-		// `true || false && cd elsewhere` skips the false and keeps the success, so the cd
-		// runs. A branch this walk cannot evaluate may have run, so its command stays checked
-		// and the verdict stays unknowable.
-		const runs = branchRuns(part.operator, previousVerdict);
-		if (runs === false) continue;
-		// The directories this command can run in: an && branch only behind a success, an ||
-		// branch only behind a failure, and an unconditional separator after either outcome.
-		const here = part.operator === "&&" ? successDirs : part.operator === "||" ? failureDirs : unionDirs(successDirs, failureDirs);
-		if (parsed.rest === "cd" || parsed.rest.startsWith("cd ") || parsed.rest.startsWith("cd\t")) {
-			// A cd carries the shell to its target only when it succeeds: a target that is missing,
-			// or that the shell may not enter, fails and leaves the shell where it was. Both
-			// outcomes stay tracked — the destination on success, the same directories on failure —
-			// so the branch a failed cd sends the shell into is judged instead of being dropped as
-			// unreachable. A form whose target this walk cannot name leaves the success path
-			// unresolvable, never the destination as proof of the effective directory.
-			successDirs = here.map((dir) => cdTargetDir(parsed.rest, dir));
-			failureDirs = here;
-			previousVerdict = undefined;
-			continue;
+	// The states the shell can be in when the next pipeline runs, one per path this walk still
+	// follows and starting at the caller's cwd: a pipeline the shell provably skips passes every
+	// state through untouched, while a pipeline it runs applies its own effects to the states
+	// that ran it only.
+	let states: CwdState[] = [{ dir: startCwd, verdict: true }];
+	for (const pipeline of pipelines) {
+		// Reachability is decided once for the whole pipeline: the shell reaches it or skips it as
+		// one, so a skipped group runs none of its stages - none of them moves a directory,
+		// rebuilds an index, or replaces the last executed status.
+		const executed = states.filter((state) => branchRuns(pipeline.operator, state.verdict) !== false);
+		const next = states.filter((state) => branchRuns(pipeline.operator, state.verdict) === false);
+		// Every stage starts in the parent shell's directory - a cd inside a stage moves that
+		// stage's own subshell - so each rebuild of the pipeline is judged there.
+		if (executed.length > 0) {
+			for (const stage of pipeline.stages) {
+				const parsed = leadingAssignments(stage);
+				const verb = rebuild.exec(parsed.rest);
+				if (verb !== null) {
+					rebuilds.push({ rest: parsed.rest, verb: verb[1] as "index" | "init", allowIndexOverride: parsed.allowIndexOverride, cwds: executed.map((state) => state.dir) });
+				}
+			}
 		}
-		// Any other command leaves the directory alone, on either outcome — until one that can
-		// move it in a form this walk cannot follow makes every later command's directory
-		// unknowable.
-		successDirs = UNTRACKABLE_CWD_COMMAND.test(parsed.rest) ? [undefined] : here;
-		failureDirs = successDirs;
-		const verb = rebuild.exec(parsed.rest);
-		if (verb !== null) {
-			rebuilds.push({ rest: parsed.rest, verb: verb[1] as "index" | "init", allowIndexOverride: parsed.allowIndexOverride, cwds: here });
+		const lastStage = leadingAssignments(pipeline.stages[pipeline.stages.length - 1]!).rest;
+		for (const state of executed) {
+			if (pipeline.stages.length > 1) {
+				// A stage of a pipeline runs in its own subshell, so nothing it does to its own
+				// directory reaches the parent shell - except the last stage's cd when the lastpipe
+				// option puts that stage in the parent, which keeps both directories possible for
+				// the commands after it.
+				addState(next, { dir: state.dir, verdict: pipeline.status });
+				if (isCdCommand(lastStage)) addState(next, { dir: cdTargetDir(lastStage, state.dir), verdict: pipeline.status });
+				else if (UNTRACKABLE_CWD_COMMAND.test(lastStage)) addState(next, { dir: undefined, verdict: pipeline.status });
+				continue;
+			}
+			if (isCdCommand(lastStage)) {
+				// A cd carries the shell to its target only when it succeeds: a target that is
+				// missing, or that the shell may not enter, fails and leaves the shell where it was.
+				// Both outcomes stay tracked - the destination with the success it proves, the
+				// current directory with the failure - so the branch a failed cd sends the shell
+				// into is judged instead of being dropped as unreachable. A form whose target this
+				// walk cannot name leaves the success path unresolvable, never the destination as
+				// proof of the effective directory.
+				addState(next, { dir: cdTargetDir(lastStage, state.dir), verdict: true });
+				addState(next, { dir: state.dir, verdict: false });
+				continue;
+			}
+			// Any other command leaves the directory alone, on either outcome - until one that can
+			// move it in a form this walk cannot follow makes every later command's directory
+			// unknowable.
+			addState(next, { dir: UNTRACKABLE_CWD_COMMAND.test(lastStage) ? undefined : state.dir, verdict: pipeline.status });
 		}
-		previousVerdict = runs === true ? listStatus[index] : undefined;
+		states = next;
 	}
 	return rebuilds;
 }

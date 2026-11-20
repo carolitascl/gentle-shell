@@ -1597,6 +1597,97 @@ test("the guard keeps a pipeline's status unknowable unless every stage agrees",
 	assert.equal(reached?.block, true, "a certain failure still makes its || branch reach the rebuild");
 });
 
+/** The tool_call guard's verdict function over a spaced indexed/fresh checkout pair, with the
+ * launch override cleared for the test's lifetime: the callers the pipeline and branch tests
+ * judge a command list against. */
+async function guardVerdicts(t: test.TestContext): Promise<{
+	verdictFrom: (cwd: string, command: string) => unknown;
+	indexed: string;
+	fresh: string;
+}> {
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+	codeGraphTools({
+		registerTool() { /* the registered tool's shape is covered above */ },
+		on(event, handler) { handlers.set(event, handler); },
+	} as unknown as ExtensionAPI);
+	const guard = handlers.get("tool_call");
+	const { indexed, fresh } = await spacedWorkspaces(t);
+	const previousOverride = process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	t.after(() => {
+		if (previousOverride === undefined) delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+		else process.env.GENTLE_CODEGRAPH_ALLOW_INDEX = previousOverride;
+	});
+	return {
+		indexed,
+		fresh,
+		verdictFrom: (cwd, command) =>
+			(guard as (event: unknown, ctx: unknown) => unknown)({ toolName: "bash", input: { command } }, { cwd } as ExtensionContext),
+	};
+}
+
+test("the guard reads an adjacent |& as one pipeline separator", async (t) => {
+	const verdict = await guardOnIndexedWorkspace(t);
+
+	// `|&` pipes stderr into the next stage as well, so the stages are one pipeline: its first
+	// stage certainly fails, no other reading proves the group's status, and the || continuation
+	// therefore runs in the indexed checkout.
+	const piped = verdict("false |& true | true || codegraph init") as { block?: boolean; reason?: string } | undefined;
+	assert.equal(piped?.block, true, "a stage joined by |& belongs to the same pipeline, whose failure reaches the || continuation");
+	assert.match(piped?.reason ?? "", /an index already exists/);
+	// The two-stage form folds the same way.
+	const direct = verdict("false |& true || codegraph init") as { block?: boolean } | undefined;
+	assert.equal(direct?.block, true, "an adjacent |& folds both stages, so the failed first stage keeps the group's status unproven");
+	// A lone & is still a background separator: the second true is a command of its own, and
+	// its certain success makes the || branch unreachable.
+	assert.equal(verdict("true & true || codegraph init"), undefined, "a separate background separator never joins a pipeline");
+});
+
+test("the guard decides a pipeline's reachability once, not stage by stage", async (t) => {
+	const verdict = await guardOnIndexedWorkspace(t);
+
+	// false fails, so the shell skips the whole && pipeline: none of its stages runs, and the
+	// init joined to it by | never reaches any directory.
+	assert.equal(verdict("false && true | codegraph init"), undefined, "a skipped pipeline runs none of its stages, whatever separator joins them");
+	// A pipeline whose guard this walk cannot evaluate is still judged in full.
+	const reached = verdict("grep -q x file && true | codegraph init") as { block?: boolean } | undefined;
+	assert.equal(reached?.block, true, "an unknowable guard leaves the whole pipeline running, so its rebuild is judged");
+});
+
+test("the guard keeps a pipeline stage's cd out of the parent shell's directory", async (t) => {
+	const { verdictFrom, indexed, fresh } = await guardVerdicts(t);
+	const shellQuoted = (path: string) => "'" + path + "'";
+
+	// Every stage of a pipeline runs in its own subshell, so without lastpipe the cd of the
+	// last stage never moves the parent: the && init still runs in the indexed caller.
+	const piped = verdictFrom(indexed, "true | cd " + shellQuoted(fresh) + " && codegraph init") as { block?: boolean; reason?: string } | undefined;
+	assert.equal(piped?.block, true, "a cd inside a pipeline stage leaves the parent's indexed directory in place for the && rebuild");
+	assert.match(piped?.reason ?? "", /an index already exists/);
+	// A command outside any pipeline is the parent shell itself, so its cd still moves it.
+	assert.equal(verdictFrom(indexed, "cd " + shellQuoted(fresh) + " && codegraph init"), undefined, "a cd outside a pipeline still moves the parent shell");
+	// With lastpipe the stage's cd can reach the parent, so the destination stays a possible
+	// directory for the continuation rather than being dropped.
+	const lastpipe = verdictFrom(fresh, "true | cd " + shellQuoted(indexed) + " && codegraph init") as { block?: boolean } | undefined;
+	assert.equal(lastpipe?.block, true, "a last-stage cd that lastpipe applies in the parent keeps the destination live");
+});
+
+test("the guard carries a skipped branch's directory and status forward", async (t) => {
+	const { verdictFrom, indexed, fresh } = await guardVerdicts(t);
+	const shellQuoted = (path: string) => "'" + path + "'";
+	const missing = join(fresh, "missing checkout");
+
+	// The cd fails at run time, so its && continuation never runs and the shell stays in the
+	// indexed caller for the unconditional init after the semicolon.
+	const skipped = verdictFrom(indexed, "cd " + shellQuoted(missing) + " && true; codegraph init") as { block?: boolean; reason?: string } | undefined;
+	assert.equal(skipped?.block, true, "a skipped && command leaves the failed cd's directory live for the command after it");
+	assert.match(skipped?.reason ?? "", /an index already exists/);
+	// The skipped state keeps its own directory instead of inheriting the branch destination.
+	const destination = verdictFrom(indexed, "cd " + shellQuoted(fresh) + " && true; codegraph init") as { block?: boolean } | undefined;
+	assert.equal(destination?.block, true, "the cd's failure path keeps the indexed caller reachable for the unconditional init");
+	// The && continuation alone still runs at the destination only, which holds no index.
+	assert.equal(verdictFrom(indexed, "cd " + shellQuoted(missing) + " && codegraph init"), undefined, "a cd that could fail never runs its && rebuild in the caller's checkout");
+});
+
 test("the guard forms a conditional operator only from adjacent separators", async (t) => {
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
 	codeGraphTools({

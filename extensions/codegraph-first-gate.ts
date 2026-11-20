@@ -122,13 +122,15 @@ function restIsInert(rest: string): boolean {
  * bash command string runs `codegraph query` or `codegraph explore` in an executable command
  * position, and how a completion can prove the invocation ran. Quoted text is masked to
  * filler first, so a separator or command word inside quotes - printf '%s\n' 'note;
- * codegraph query' - is never an execution. At each command position, leading NAME=VALUE
- * assignments are skipped (LC_ALL=C codegraph query ... runs the query, and so does a
- * quoted value - LC_ALL=\"C\" - because only the NAME= prefix must be unquoted), and so is
- * the shell's `command` wrapper (command codegraph query ... runs it, while its lookup form
- * command -v codegraph never credits) and the `!` negation reserved word (`! codegraph query
- * lease` runs the query and only inverts the status the call reports, which is why a negated
- * on-success position never credits); init, status, and every other subcommand never match
+ * codegraph query' - is never an execution. At each command position the shell's pipeline
+ * negation is consumed first: bash reads a leading `!` ahead of the simple command's
+ * assignments, so `! codegraph query lease` runs the query and only inverts the status the
+ * call reports - which is why a negated on-success position never credits - while
+ * `LC_ALL=C ! codegraph query lease` runs a command named `!` and no query at all. Leading
+ * NAME=VALUE assignments are skipped next (only the NAME= prefix must be unquoted, so a
+ * quoted value is still an assignment), and then the shell's `command` wrapper (command
+ * codegraph query ... runs it, while its lookup form command -v codegraph never credits).
+ * Init, status, and every other subcommand never match
  * for credit, though runsCodegraph still reports them: every native `codegraph` invocation is
  * an active graph execution, while only query and explore can credit. A separator list (&&,
  * ||) guarding the invocation shrinks the credit to what its position
@@ -171,10 +173,12 @@ function analyzeCliQuery(command: string): { present: boolean; credit: CliQueryC
 	const creditSegment = (isFinal: boolean) => {
 		if (words.length === 0) return;
 		let at = 0;
-		while (at < words.length && isLeadingAssignment(words[at]!.text)) at++;
 		// `!` is a reserved word, never the executable: `! codegraph query lease` runs the query
-		// and only inverts the status the call reports.
+		// and only inverts the status the call reports. Bash reads the pipeline negation ahead of
+		// the simple command's assignments, so a `!` behind one is an ordinary command word -
+		// `LC_ALL=C ! codegraph query lease` runs `!`, not CodeGraph.
 		while (at < words.length && !words[at]!.quoted && words[at]!.text === "!") at++;
+		while (at < words.length && isLeadingAssignment(words[at]!.text)) at++;
 		if (at < words.length && !words[at]!.quoted && words[at]!.text === "command") at++;
 		const executable = words[at];
 		const subcommand = words[at + 1];
@@ -243,6 +247,9 @@ function analyzeCliQuery(command: string): { present: boolean; credit: CliQueryC
 			endWord();
 			creditSegment(false);
 			listCondition = "none";
+			// A newline starts another pipeline, exactly as an unconditional separator does: the
+			// `!` in front of the pipeline before it never inverts this one.
+			pipelineNegated = false;
 		} else if (ch === "(" || ch === ")") {
 			endWord();
 			// The words pending at a closing parenthesis are the subshell's last command, and

@@ -1215,3 +1215,59 @@ test("(ao) a negation over the query's group inverts the reported status, so a s
 	fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: "ao6" });
 	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search" }), undefined, "a cancelled double negation leaves the guarded query's success as proof it ran");
 });
+
+test("(ap) a ! behind a leading assignment is a command word, never pipeline negation", (t) => {
+	const handlers = installGate(t);
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "tool_execution_start", { toolName: "grep", toolCallId: "ap-arm", args: { pattern: "symbol" } });
+	// The pipeline negation must lead the pipeline, ahead of the simple command's assignments:
+	// bash reads `LC_ALL=C ! ...` as the command named `!`, which does not exist. The query
+	// never runs, so the command-not-found completion proves nothing.
+	fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: "ap1", args: { command: "LC_ALL=C ! codegraph query lease" } });
+	fire(handlers, "tool_result", { toolCallId: "ap1", isError: true });
+	fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: "ap1" });
+	assert.deepEqual(
+		fire(handlers, "tool_call", { toolName: "mem_search" }),
+		{ block: true, reason: BLOCK_REASON },
+		"a ! placed behind an assignment runs no query, so its completion never credits",
+	);
+	// The negation in front of the assignments is the reserved word: the query runs and only
+	// the status the call reports is inverted, which is not what credits an unconditional one.
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "tool_execution_start", { toolName: "grep", toolCallId: "ap-arm-2", args: { pattern: "symbol" } });
+	fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: "ap2", args: { command: "! LC_ALL=C codegraph query lease" } });
+	fire(handlers, "tool_result", { toolCallId: "ap2", isError: true });
+	fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: "ap2" });
+	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search" }), undefined, "a negation ahead of the assignments still runs the query, so the completed call credits");
+});
+
+test("(aq) a newline ends a negated pipeline, so the next pipeline's query is unnegated", (t) => {
+	const handlers = installGate(t);
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "tool_execution_start", { toolName: "grep", toolCallId: "aq-arm", args: { pattern: "symbol" } });
+	// `! false` negates its own pipeline, and the newline starts another: the guarded query of
+	// the second pipeline reports its own status, which the call's success proves.
+	fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: "aq1", args: { command: "! false\n(true && codegraph query lease)" } });
+	fire(handlers, "tool_result", { toolCallId: "aq1", isError: false });
+	fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: "aq1" });
+	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search" }), undefined, "a negation in an earlier pipeline never inverts the query's own");
+	// On one line the `!` and the group are the same pipeline, so the inversion stands.
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "tool_execution_start", { toolName: "grep", toolCallId: "aq-arm-2", args: { pattern: "symbol" } });
+	fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: "aq2", args: { command: "! (true && codegraph query lease)" } });
+	fire(handlers, "tool_result", { toolCallId: "aq2", isError: false });
+	fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: "aq2" });
+	assert.deepEqual(
+		fire(handlers, "tool_call", { toolName: "mem_search" }),
+		{ block: true, reason: BLOCK_REASON },
+		"a negation over the query's own pipeline still inverts the reported status",
+	);
+	// A trailing newline is the string's terminator, not a separator: the negated query keeps
+	// its position and runs, and an unconditional invocation credits whatever it reports.
+	fire(handlers, "before_agent_start", { messageType: "user" });
+	fire(handlers, "tool_execution_start", { toolName: "grep", toolCallId: "aq-arm-3", args: { pattern: "symbol" } });
+	fire(handlers, "tool_execution_start", { toolName: "bash", toolCallId: "aq3", args: { command: "! codegraph query lease\n" } });
+	fire(handlers, "tool_result", { toolCallId: "aq3", isError: true });
+	fire(handlers, "tool_execution_end", { toolName: "bash", toolCallId: "aq3" });
+	assert.equal(fire(handlers, "tool_call", { toolName: "mem_search" }), undefined, "a trailing newline stays inert: the negated unconditional query still ran and credits");
+});
