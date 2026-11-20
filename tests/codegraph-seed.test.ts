@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync, spawn } from "node:child_process";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { retryTransient, seedWorktreeIndex, worktreeMainRoot, type SeedInput } from "../lib/codegraph-seed.ts";
-import { lockPathFor, tryAcquireLease } from "../lib/codegraph-lease.ts";
+import { leaseHostIdentity, lockPathFor, readLeaseVerdict, tryAcquireLease } from "../lib/codegraph-lease.ts";
 
 /** git that fails the test WITH stderr instead of swallowing it. */
 function git(args: readonly string[], cwd: string): void {
@@ -372,6 +372,9 @@ test("a non-IOERR sqlite snapshot error fails the seed without burning retries",
 });
 
 test("a seed displaced while a snapshot retry waits never publishes over the replacement", async (t) => {
+	if (leaseHostIdentity() === null) {
+		return t.skip("the reclaim fixture needs a host identity: a host-less token (Windows) whose holder pid is alive fails closed to unknown, so the displacement cannot be staged here");
+	}
 	const { worktree } = worktreePair(t);
 	const sandbox = mkdtempSync(join(tmpdir(), "gentle-pi-seed-snapshot-fence-"));
 	t.after(() => rmSync(sandbox, { recursive: true, force: true }));
@@ -460,6 +463,9 @@ test("an unreadable main index fails closed instead of falling through to init",
 });
 
 test("a seed displaced from its init lease before publication never replaces the newer index", async (t) => {
+	if (leaseHostIdentity() === null) {
+		return t.skip("the reclaim fixture needs a host identity: a host-less token (Windows) whose holder pid is alive fails closed to unknown, so the displacement cannot be staged here");
+	}
 	const { worktree } = worktreePair(t);
 	const sandbox = mkdtempSync(join(tmpdir(), "gentle-pi-seed-fence-"));
 	t.after(() => rmSync(sandbox, { recursive: true, force: true }));
@@ -484,6 +490,21 @@ test("a seed displaced from its init lease before publication never replaces the
 	assert.equal(result.outcome, "seed-failed", "a displaced seed stands down so the caller falls back to init");
 	assert.equal(readFileSync(join(worktree, ".codegraph", "codegraph.db"), "utf8"), "newer-index-bytes", "the newer database the other session published survives");
 	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore", "codegraph.db"], "no staging leftover and no stale seed sidecar is left behind");
+});
+
+test("an expired host-less lease whose holder pid is alive is never reclaimable (the displacement fixtures' platform gate)", (t) => {
+	const sandbox = mkdtempSync(join(tmpdir(), "gentle-pi-seed-hostless-verdict-"));
+	t.after(() => rmSync(sandbox, { recursive: true, force: true }));
+	// The token shape acquireInitLock writes where no host identity can be derived (win32):
+	// expired past its TTL, holder pid still alive — here this process, exactly the
+	// displacement fixtures' in-process holder. The lease's fail-closed provenance rules
+	// refuse that reclaim on every platform, which is why the displacement fixtures skip
+	// where leaseHostIdentity() is null instead of staging an unreachable displacement.
+	const lockPath = join(sandbox, "hostless.init.json");
+	const token = { kind: "init", pid: process.pid, startedAt: Date.now() - 2_000, expiresAt: Date.now() - 1_000, nonce: "seed-acquisition" };
+	writeFileSync(lockPath, JSON.stringify(token) + "\n");
+	assert.equal(readLeaseVerdict(lockPath, Date.now()), "unknown", "an expired host-less token with a live holder is unknown, never stealable");
+	assert.equal(tryAcquireLease(lockPath, "init", 600_000, Date.now()), undefined, "the reclaim the displacement fixtures rely on is refused for this token shape");
 });
 
 test("a same-pid successor replacing the lease before acquisition resumes cannot authorize publication", async (t) => {
@@ -563,15 +584,16 @@ test("a successor appearing at link refusal remains untouched", async (t) => {
 	const { worktree } = worktreePair(t);
 	const target = join(worktree, ".codegraph", "codegraph.db");
 	let attempts = 0;
+	let linkedDestination: string | undefined;
 	const result = await seedWorktreeIndex(seedHarness(worktree, {
 		link: (_staged, destination) => {
 			attempts += 1;
-			assert.equal(destination, target);
-			assert.equal(fileAbsent(target), true);
+			linkedDestination = destination;
 			writeFileSync(target, "successor");
 			throw Object.assign(new Error("unsupported"), { code: "ENOTSUP" });
 		},
 	}).input);
+	assert.equal(linkedDestination, target, "the seed links the staged snapshot to the final database path");
 	assert.equal(result.outcome, "seed-failed");
 	assert.equal(attempts, 1);
 	assert.equal(readFileSync(target, "utf8"), "successor");
@@ -582,17 +604,18 @@ test("a refused link never publishes a final database", async (t) => {
 	const { worktree } = worktreePair(t);
 	const target = join(worktree, ".codegraph", "codegraph.db");
 	let attempts = 0;
+	let linkedDestination: string | undefined;
 	const result = await seedWorktreeIndex(seedHarness(worktree, {
 		link: (_staged, destination) => {
 			attempts += 1;
-			assert.equal(destination, target);
-			assert.equal(fileAbsent(target), true);
+			linkedDestination = destination;
 			throw Object.assign(new Error("unsupported"), { code: "ENOTSUP" });
 		},
 	}).input);
+	assert.equal(linkedDestination, target, "the seed links the staged snapshot to the final database path");
 	assert.equal(result.outcome, "seed-failed");
 	assert.equal(attempts, 1);
-	assert.equal(fileAbsent(target), true);
+	assert.equal(fileAbsent(target), true, "the refused link leaves the final name absent");
 	assert.deepEqual(readdirSync(join(worktree, ".codegraph")), [".gitignore"]);
 });
 
@@ -652,9 +675,18 @@ test("a link-less filesystem leaves the validated snapshot unpublished", async (
 
 test("a missing staged snapshot on a link-less filesystem leaves no final database", async (t) => {
 	const { worktree } = worktreePair(t);
+	let linkError: NodeJS.ErrnoException | undefined;
 	const { input } = seedHarness(worktree, {
-		link: () => {
-			throw Object.assign(new Error("hard links are not supported"), { code: "ENOTSUP" });
+		link: (staged, destination) => {
+			// A real hard link: the missing staged database itself must fail the
+			// publication — an injected ENOTSUP would pass whatever staging held (the
+			// unsupported-filesystem test covers that shape).
+			try {
+				linkSync(staged, destination);
+			} catch (error) {
+				linkError = error as NodeJS.ErrnoException;
+				throw error;
+			}
 		},
 		run: async () => {
 			// Validation passes, but the staged snapshot is gone before publication.
@@ -667,6 +699,7 @@ test("a missing staged snapshot on a link-less filesystem leaves no final databa
 
 	const result = await seedWorktreeIndex(input);
 
+	assert.equal(linkError?.code, "ENOENT", "the real link attempt failed on the missing staged database, not an injected ENOTSUP");
 	assert.equal(result.outcome, "seed-failed", "publication fails closed");
 	assert.equal(fileAbsent(join(worktree, ".codegraph", "codegraph.db")), true, "no database is published");
 	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore"], "no staging leftover and no claim remains");
@@ -701,6 +734,9 @@ test("a seed whose init-lock nonce is unreadable at publication stands down", as
 });
 
 test("a seed displaced while a transient publication retry waits never publishes", async (t) => {
+	if (leaseHostIdentity() === null) {
+		return t.skip("the reclaim fixture needs a host identity: a host-less token (Windows) whose holder pid is alive fails closed to unknown, so the displacement cannot be staged here");
+	}
 	if (process.platform === "win32") return t.skip("chmod-based EACCES is a POSIX retry trigger");
 	// chmod only forces the transient failure where the permission really blocks writes: under
 	// CAP_DAC_OVERRIDE (root) the first placement succeeds, the displacement never happens, and
@@ -723,6 +759,7 @@ test("a seed displaced while a transient publication retry waits never publishes
 	const locksDir = join(sandbox, "locks");
 	const lockPath = lockPathFor(worktree, "init", locksDir);
 	let displaced = false;
+	let reclaimed = false;
 	const { input } = seedHarness(worktree, {
 		locksDir,
 		run: async () => {
@@ -741,14 +778,14 @@ test("a seed displaced while a transient publication retry waits never publishes
 			displaced = true;
 			chmodSync(join(worktree, ".codegraph"), 0o755);
 			const { expiresAt } = JSON.parse(readFileSync(lockPath, "utf8")) as { expiresAt: number };
-			const reclaimer = tryAcquireLease(lockPath, "init", 600_000, expiresAt + 1_000, worktree);
-			assert.ok(reclaimer, "the other session reclaims the lease during the retry wait");
+			if (tryAcquireLease(lockPath, "init", 600_000, expiresAt + 1_000, worktree) !== undefined) reclaimed = true;
 		},
 	});
 
 	const result = await seedWorktreeIndex(input);
 
 	assert.equal(result.outcome, "seed-failed", "a seed displaced mid-retry aborts instead of publishing on a lease it no longer owns");
+	assert.equal(reclaimed, true, "a successor reclaimed the lease during the backoff wait: the ownership fence, not the placement, stood the displaced seed down");
 	assert.equal(fileAbsent(join(worktree, ".codegraph", "codegraph.db")), true, "the displaced seed publishes nothing: with the destination left empty, only the ownership fence — not the no-replace placement — stood it down");
 	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore"], "no staging leftover and no stale seed file is left behind");
 });
