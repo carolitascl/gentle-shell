@@ -1,4 +1,4 @@
-import { closeSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { acquireInitLock, defaultLocksDir, indexState, lockPathFor, readLeaseVerdict, type LeaseToken } from "./codegraph-lease.ts";
 import { linkedWorktreeIdentity, SYNC_TIMEOUT_MS } from "./codegraph-readiness.ts";
@@ -25,7 +25,7 @@ export interface SeedInput {
 	 * tracked entries, which a bare exit status cannot prove either way. */
 	run(args: readonly string[], cwd: string, timeoutMs: number): Promise<SeedSyncReport>;
 	/** The atomic hard-link publish attempt; injectable so tests can simulate a filesystem
-	 * that refuses hard links and exercise the move-based no-replace fallback that answers it. */
+	 * that refuses hard links and verify that publication fails closed. */
 	link?(existingPath: string, newPath: string): void;
 }
 
@@ -111,34 +111,6 @@ export async function retryTransient<T>(
 	throw lastError;
 }
 
-/** Publishes the completed staged database at its final name for filesystems that refuse
- * hard links. The exclusive create ("wx") is the no-replace claim: it loses cleanly to
- * EEXIST against anything that already holds the destination name, exactly like the link
- * did, and it is the only file this publish may ever remove. The rename then lands the
- * already-complete staged file over that claim in one atomic step, so the final name is
- * only ever absent or whole — never the empty-then-growing file a copy written in place
- * would expose to every reader and to a mid-copy crash — and no database byte is copied
- * through the session's event loop at all. The interval between claim and rename is two
- * syscalls wide; a hard crash inside it can leave only the empty claim behind, the one
- * residue a link-less filesystem cannot close. */
-function publishMoveExclusiveCreate(src: string, dst: string): void {
-	let claimLanded = false;
-	try {
-		closeSync(openSync(dst, "wx"));
-		claimLanded = true;
-		renameSync(src, dst);
-	} catch (error) {
-		// Only the file this publish's own exclusive create produced is removed: a concurrent
-		// publisher's file made the "wx" open fail EEXIST, so the flag was never set.
-		if (claimLanded) {
-			try {
-				rmSync(dst, { force: true });
-			} catch { /* the original failure stands */ }
-		}
-		throw error;
-	}
-}
-
 /**
  * Seeds a linked worktree's index by taking a lock-safe snapshot of the main
  * checkout's database into an isolated staging project, validating the snapshot
@@ -154,7 +126,7 @@ function publishMoveExclusiveCreate(src: string, dst: string): void {
  * lease's nonce: a seed displaced mid-flight stands down instead of replacing
  * the newer database the replacement holder published.
  */
-export async function seedWorktreeIndex(input: SeedInput): Promise<{ outcome: SeedOutcome }> {
+export async function seedWorktreeIndex(input: SeedInput): Promise<{ outcome: SeedOutcome; error?: string }> {
 	const {
 		sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 		importSqlite = () => import("node:sqlite"),
@@ -186,26 +158,9 @@ export async function seedWorktreeIndex(input: SeedInput): Promise<{ outcome: Se
 	});
 	if (lock.outcome === "present") return { outcome: "target-exists" };
 	if (lock.outcome === "skipped") return { outcome: "deferred" };
-	// This seed's identity for the fences below, bound to THIS acquisition rather than to
-	// whichever token sits at the path when the seed next looks — the lease module's owns()
-	// pattern (release and adopt are fenced on it too). Two facts, read in the same
-	// synchronous stretch that follows the awaited acquisition, pin the token to it: the
-	// token createLease wrote carries this process's pid, and no other live process on this
-	// host shares that pid — so a seed suspended past its lease TTL between the acquisition
-	// and this read cannot adopt the successor that reclaimed it (a wall-clock bound alone
-	// could not tell a post-suspension read from the successor's newer startedAt). And the
-	// token's startedAt can never postdate the acquisition's return, which bounds the one
-	// cross-host escape — a shared locks dir where another machine's successor happens to
-	// carry this pid. Anything else is a token this acquisition cannot prove it owns: the
-	// seed stands down instead of fencing on the successor's nonce while it holds the lease.
-	const acquiredAt = Date.now();
-	const acquiredToken = leaseTokenIdentity(lockPathFor(input.cwd, "init", locksDir));
-	const heldNonce =
-		acquiredToken !== undefined && acquiredToken.pid === process.pid && acquiredToken.startedAt <= acquiredAt
-			? acquiredToken.nonce
-			: undefined;
-	// The publication fence as a predicate, shared by the pre-publish check and the move
-	// fallback's re-check: the token at the lock path must still be this acquisition's nonce.
+	// Bind every fence to the acquisition, not a successor observed after suspension.
+	const heldNonce = lock.nonce;
+	// The token at the lock path must still be this acquisition's nonce.
 	const publishFenceHolds = () => {
 		const nonce = leaseTokenIdentity(lockPathFor(input.cwd, "init", locksDir))?.nonce;
 		return heldNonce !== undefined && nonce === heldNonce;
@@ -273,7 +228,7 @@ export async function seedWorktreeIndex(input: SeedInput): Promise<{ outcome: Se
 					// The wait before a retry can outlast the init lease, exactly like the
 					// publication fence below: a seed displaced mid-snapshot stands down instead
 					// of paying for another attempt on a lease it no longer holds.
-					if (leaseTokenIdentity(lockPathFor(input.cwd, "init", locksDir))?.nonce !== heldNonce) {
+					if (!publishFenceHolds()) {
 						throw new Error("the init lease changed hands while the snapshot waited to retry");
 					}
 				}, isTransientSqliteError);
@@ -299,9 +254,8 @@ export async function seedWorktreeIndex(input: SeedInput): Promise<{ outcome: Se
 			// hard displacement bound, so this seed can be reclaimed mid-flight — suspended past the
 			// TTL — while another session takes the lease and publishes a newer index into this worktree.
 			// The publish below never replaces what the target holds, so a displaced seed (a different
-			// or unreadable nonce) stands down before it instead of racing the newer database, and the
-			// caller falls back to init. The displaced lock's own release() is nonce-fenced and
-			// removes nothing.
+			// or unreadable nonce) stands down before it instead of racing the newer database.
+			// The displaced lock's own release() is nonce-fenced and removes nothing.
 			// An unreadable ACQUISITION identity stands down the same way: undefined === undefined would
 			// otherwise pass the fence and publish over a database this seed can no longer prove it owns.
 			if (!publishFenceHolds()) {
@@ -321,43 +275,21 @@ export async function seedWorktreeIndex(input: SeedInput): Promise<{ outcome: Se
 				// every wait, so a seed displaced mid-publication aborts instead of linking over
 				// the replacement holder's index.
 				await retryTransient(() => link(stagedPath, targetDb), sleep, () => {
-					if (leaseTokenIdentity(lockPathFor(input.cwd, "init", locksDir))?.nonce !== heldNonce) {
+					if (!publishFenceHolds()) {
 						throw new Error("the init lease changed hands while the publication waited to retry");
 					}
 				});
 			} catch (error) {
-				// Filesystems without hard links — a continuously available SMB share refuses
-				// CreateHardLinkW — cannot use the atomic publish, and failing flat there would
-				// leave such a share unindexed every session. Only a filesystem refusal earns the
-				// move fallback below: EEXIST means a concurrent publisher's database already holds
-				// the name, and the retry fence's own Error (a displaced seed) carries no errno
-				// code — both keep failing without a second attempt at the target.
+				// A copy exposes partial data and rename can overwrite a successor. Without an
+				// atomic no-replace link, leave the destination untouched.
 				const code = (error as NodeJS.ErrnoException).code;
-				if (code === undefined || code === "EEXIST") return { outcome: "seed-failed" };
-				// The refused link proves nothing about ownership anymore: a seed displaced since
-				// the pre-publish fence stands down before the move too.
-				if (!publishFenceHolds()) {
-					return { outcome: "seed-failed" };
+				if (code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "ENOSYS") {
+					return { outcome: "seed-failed", error: "CodeGraph seed publication requires hard links; use a worktree filesystem that supports hard links." };
 				}
-				// No-replace move publish for the link-less filesystem: the staged snapshot and
-				// the final name sit in the same directory (one filesystem), so the completed,
-				// validated database is moved into place instead of copied — the exclusive-create
-				// claim fails EEXIST against anything that reached the target first, exactly like
-				// the link did, so a concurrent publisher keeps its database, and the rename lands
-				// the whole file at once, so no reader ever sees a partial database under the final
-				// name and no database byte is copied on the session's event loop. Single-shot and
-				// fail-closed: a failed move removes only the claim it placed, leaving the target
-				// exactly as absent as before, and the next session's seed retries.
-				try {
-					publishMoveExclusiveCreate(stagedPath, targetDb);
-				} catch {
-					// A failed publish removes nothing at the final path it did not claim itself:
-					// the staged database goes with the staging directory below, and whatever sits
-					// at the target now — an independent publish that landed while validation was
-					// pending, or a name this seed never placed — is not this seed's to remove. A
-					// displaced lock's own release() is nonce-fenced and removes nothing either.
-					return { outcome: "seed-failed" };
+				if (code === "EPERM") {
+					return { outcome: "seed-failed", error: "CodeGraph seed hard-link publication failed; check filesystem hard-link support and permissions." };
 				}
+				return { outcome: "seed-failed" };
 			}
 			return { outcome: "seeded" };
 		} finally {

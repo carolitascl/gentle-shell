@@ -517,7 +517,7 @@ export interface ReadinessInput {
 	initLockWaitMs?: number;
 
 	/** Seeds a linked worktree from its main checkout; undefined disables seeding. */
-	seed?(cwd: string): Promise<{ outcome: SeedOutcome }>;
+	seed?(cwd: string): Promise<{ outcome: SeedOutcome; error?: string }>;
 	env: Record<string, string | undefined>;
 	reason: SessionStartReason;
 	/** Whether cwd is a real git project root equal to the workspace (the tool's workspace guard). */
@@ -568,6 +568,7 @@ export function prepareReadiness(input: ReadinessInput): Promise<ReadinessResult
 			if (childWorktree && action === "sync") return { action: "none", ok: true, warm: "skipped" };
 			try { input.onStart?.(action); } catch { /* never worth stopping the index */ }
 			let ok: boolean;
+			let seedError: string | undefined;
 			const syncInfo = lastInfoSink();
 			let standDown = false;
 			let alive = false;
@@ -600,7 +601,7 @@ export function prepareReadiness(input: ReadinessInput): Promise<ReadinessResult
 				// of initialized: seeded and target-exists stand done, deferred fails closed like
 				// a skipped lock, seed-failed stands down, and not-seedable — no parent index — is
 				// a fresh project that falls through to the ordinary init path.
-				let seeded: { outcome: SeedOutcome } | undefined;
+				let seeded: { outcome: SeedOutcome; error?: string } | undefined;
 				if (input.seed) seeded = await input.seed(input.cwd);
 				if (seeded !== undefined && (seeded.outcome === "seeded" || seeded.outcome === "target-exists")) {
 					ok = true;
@@ -615,6 +616,7 @@ export function prepareReadiness(input: ReadinessInput): Promise<ReadinessResult
 					// AGENTS.md: "init is for fresh projects without a parent index" — a failed
 					// copy of an existing parent index stands down; the worktree is never initialized.
 					ok = false;
+					seedError = seeded.error;
 				} else {
 					const lock = await acquireInitLock(input.cwd, {
 						locksDir: input.locksDir,
@@ -660,9 +662,9 @@ export function prepareReadiness(input: ReadinessInput): Promise<ReadinessResult
 			// A child that just seeded or initialised its own worktree never warms a daemon: it must
 			// not reach for the parent-shared project daemon at session start, and maybeRewarm
 			// already covers its queries lazily.
-			if (childWorktree) return { action, ok, warm: "skipped" };
+			if (childWorktree) return { action, ok, warm: "skipped", ...(seedError === undefined ? {} : { error: seedError }) };
 			// A failed sync still leaves an index to warm; a failed init leaves nothing worth warming.
-			if (standDown || !(action === "sync" || (action === "init" && ok))) return { action, ok, warm: "skipped" };
+			if (standDown || !(action === "sync" || (action === "init" && ok))) return { action, ok, warm: "skipped", ...(seedError === undefined ? {} : { error: seedError }) };
 			try { input.onWarmStart?.(); } catch { /* never worth stopping the warm-up */ }
 			try {
 				return { action, ok, warm: (await input.warm(input.cwd)) ? "ok" : "failed" };

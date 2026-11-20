@@ -391,6 +391,8 @@ function adoptWriterPid(path: string, pid: number, proxy: boolean, now: number =
 }
 
 export interface AcquiredLease {
+	/** The identity created by this acquisition; absent for legacy implementations. */
+	readonly nonce?: string;
 	/** Best-effort: a released lease nobody cleans up still expires by TTL. */
 	release(): void;
 	/** Best-effort: records this holder's spawned writer onto the token, so a dead launcher's lease
@@ -625,6 +627,7 @@ function createLease(path: string, kind: LeaseKind, ttlMs: number, now: number):
 	if (!writeTokenExclusively(path, kind, ttlMs, now, nonce)) return undefined;
 	if (readNonce(path) !== nonce) return undefined;
 	return {
+		nonce,
 		release: () => releaseOwnToken(path, nonce),
 		adopt: (pid: number, proxy: boolean) => adoptWriterPid(path, pid, proxy, Date.now(), nonce),
 	};
@@ -766,7 +769,7 @@ export function syncLeaseHeldLive(cwd: string, locksDir?: string): boolean {
 }
 
 export type InitLockOutcome =
-	| { outcome: "acquired"; release(): void; adopt(pid: number, proxy: boolean): void }
+	| { outcome: "acquired"; readonly nonce?: string; release(): void; adopt(pid: number, proxy: boolean): void }
 	/** The other session's init finished while we waited: the database file exists. */
 	| { outcome: "present" }
 	/** Still held, or unknown, past the wait budget: fail-closed, this session inits nothing. */
@@ -828,7 +831,7 @@ export async function acquireInitLock(
 			// inside the acquisition, and a free path acquires immediately too — its publish takes
 			// the same per-path mutex, so only a briefly-held mutex delays it, within that budget.
 			const lease = tryAcquireLease(path, "init", ttlMs, now(), cwd, Math.max(deadline - now(), 0));
-			if (lease) return { outcome: "acquired", release: lease.release, adopt: lease.adopt };
+			if (lease) return { outcome: "acquired", nonce: lease.nonce, release: lease.release, adopt: lease.adopt };
 			// The steal race was lost between verdict and create: keep waiting like a live holder.
 		} else if (verdict === "held-live" && exists(cwd)) {
 			return { outcome: "present" };
