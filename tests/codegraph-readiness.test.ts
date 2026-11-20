@@ -479,7 +479,7 @@ test("prepareReadiness: the init lease outlives the whole bounded retry sequence
 	// Each attempt can spend a full 600s timeout plus the runner's kill grace and wait: the
 	// lease another session sees must cover every attempt this loop may still run, or a retry
 	// spawns init -y under a lock that has lawfully moved to someone else.
-	assert.ok(observedTtl !== undefined && observedTtl >= (INIT_RETRY_COUNT + 1) * 600_000, `the init lease TTL must cover all ${INIT_RETRY_COUNT + 1} attempts, got ${observedTtl}`);
+	assert.ok(observedTtl !== undefined && observedTtl >= (INIT_RETRY_COUNT + 1) * (600_000 + 1_000 + 10_000), `the init lease TTL must cover all ${INIT_RETRY_COUNT + 1} attempts, got ${observedTtl}`);
 });
 
 test("prepareReadiness: an init that fails once succeeds on its first silent retry", async (t) => {
@@ -890,7 +890,8 @@ test("warmUpDaemonDetailed: a lock loser with no winner inside the adoption wind
 test("warmUpDaemonDetailed: a lock loser never adopts a winner that cannot answer", async (t) => {
 	if (process.platform === "win32") return t.skip("POSIX fake-bin harness");
 	const bin = dir(t, "warm-adopt-wedged-bin");
-	writeFileSync(join(bin, "codegraph"), "#!/bin/sh\nexit 0\n");
+	const pidFile = join(bin, "loser.pid");
+	writeFileSync(join(bin, "codegraph"), `#!/bin/sh\nprintf '%s' "$$" > '${pidFile}'\nexit 0\n`);
 	chmodSync(join(bin, "codegraph"), 0o755);
 	const previousPath = process.env.PATH;
 	process.env.PATH = `${bin}:${previousPath}`;
@@ -899,10 +900,14 @@ test("warmUpDaemonDetailed: a lock loser never adopts a winner that cannot answe
 	});
 	const cwd = dir(t, "warm-adopt-wedged");
 	const registry = dir(t, "warm-adopt-wedged-registry");
-	const socketPath = fakeDaemonSocketPath(process.platform, registry);
+	const socketDir = mkdtempSync("/tmp/cg-w-");
+	t.after(() => rmSync(socketDir, { recursive: true, force: true }));
+	const socketPath = fakeDaemonSocketPath(process.platform, socketDir);
 	const sockets = new Set<net.Socket>();
+	let connections = 0;
 	const server = net.createServer((socket) => {
 		/* accepts connections and never speaks: a wedged winner */
+		connections += 1;
 		sockets.add(socket);
 		socket.on("close", () => sockets.delete(socket));
 	});
@@ -918,10 +923,16 @@ test("warmUpDaemonDetailed: a lock loser never adopts a winner that cannot answe
 		return new Promise<void>((resolve) => server.close(() => resolve()));
 	});
 	await ready;
-	// The winner appears only after the loser has spawned and exited, so the adoption poll —
-	// not the start-of-warm-up gate — is the path that meets it.
-	setTimeout(() => fakeRegistryRecord(registry, cwd, socketPath, process.pid), 200);
-	const outcome = await warmUpDaemonDetailed(cwd, false, 5_000, registry, 100, 600);
+	const pending = warmUpDaemonDetailed(cwd, false, 5_000, registry, 100, 2_000);
+	const deadline = Date.now() + 1_000;
+	while (!existsSync(pidFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+	assert.ok(existsSync(pidFile), "the lock loser spawned");
+	const loserPid = Number(readFileSync(pidFile, "utf8"));
+	while (processRunning(loserPid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+	assert.equal(processRunning(loserPid), false, "the lock loser exited before publication");
+	fakeRegistryRecord(registry, cwd, socketPath, process.pid);
+	const outcome = await pending;
+	assert.ok(connections > 0, "the silent winner received a health probe connection");
 	assert.deepEqual(outcome, { ok: false }, "an alive-but-silent winner is the wedged daemon the warm gate already refuses: adoption demands an answer, not liveness");
 });
 
@@ -1313,9 +1324,12 @@ test("runCodegraph: a throwing onInfo sink never swallows the command result", {
 	t.after(() => {
 		process.env.PATH = previousPath;
 	});
+	let sinkCalls = 0;
 	const ok = await runCodegraph(["sync", "-q"], dir(t, "sink-throw-cwd"), 5_000, undefined, () => {
+		sinkCalls += 1;
 		throw new Error("diagnostic sink exploded");
 	});
+	assert.equal(sinkCalls, 1, "the diagnostic sink ran");
 	assert.equal(ok, true, "the command's actual outcome resolves even when its diagnostic callback throws");
 });
 
@@ -2321,9 +2335,11 @@ test("prepareReadiness: a failed sync beside a live daemon is not retried into a
 	writeFileSync(socket, "");
 	fakeRegistryRecord(registry, cwd, socket, process.pid);
 	const calls: string[] = [];
+	let backoffs = 0;
 	const result = await prepareReadiness(fakeInput(cwd, {
 		registryDir: registry,
 		sleep: async () => {
+			backoffs += 1;
 			// The backoff window: this workspace's regular .codegraph becomes another checkout's
 			// link, exactly the directory a fresh refresh would refuse from the start.
 			rmSync(join(cwd, ".codegraph"), { recursive: true });
@@ -2335,6 +2351,7 @@ test("prepareReadiness: a failed sync beside a live daemon is not retried into a
 		},
 		warm: async () => true,
 	}));
+	assert.equal(backoffs, 1, "the retry reached backoff");
 	assert.equal(calls.length, 1, "the retry never starts into a .codegraph the refresh no longer owns");
 	assert.equal(result.ok, false, "the first failure stands: no sync runs through another checkout's link");
 });
@@ -2395,6 +2412,30 @@ test("prepareReadiness: a backoff that outlives the sync budget returns the firs
 	assert.equal(result.ok, false, "the first failure stands when the backoff outlives the whole budget");
 	assert.deepEqual(calls.map((call) => call.args), ["sync -q"], "no retry starts once the remaining budget is nonpositive");
 	assert.equal(calls[0]?.timeoutMs, SYNC_TIMEOUT_MS, "the one attempt ran with the full budget");
+});
+
+test("prepareReadiness: directory check exhausting the sync budget prevents retry", async (t) => {
+	const cwd = dir(t, "sync-directory-expired");
+	writeDb(cwd);
+	const registry = dir(t, "sync-directory-expired-registry");
+	const socket = join(registry, "live.sock");
+	writeFileSync(socket, "");
+	fakeRegistryRecord(registry, cwd, socket, process.pid);
+	const realNow = Date.now;
+	const start = realNow();
+	let afterBackoff = false;
+	let clockReads = 0;
+	let attempts = 0;
+	t.mock.method(Date, "now", () => afterBackoff && ++clockReads > 1 ? start + SYNC_TIMEOUT_MS : start);
+	t.after(() => t.mock.restoreAll());
+	const result = await prepareReadiness(fakeInput(cwd, {
+		registryDir: registry,
+		sleep: async () => { afterBackoff = true; },
+		run: async () => { attempts += 1; return false; },
+		warm: async () => true,
+	}));
+	assert.equal(result.ok, false);
+	assert.equal(attempts, 1, "no retry starts if directory inspection exhausts the budget");
 });
 
 test("prepareReadiness: without a live daemon the sync stays single-shot and reports daemonAlive false", async (t) => {

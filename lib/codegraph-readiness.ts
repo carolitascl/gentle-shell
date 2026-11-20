@@ -106,7 +106,9 @@ async function runSyncWithRetry(
 	// the same directory a fresh refresh would refuse — so the retry must not lower the guard
 	// the first attempt ran under.
 	if (!safeIndexDirectory(cwd)) return false;
-	return attempt(Math.max(deadline - Date.now(), 0));
+	const remaining = deadline - Date.now();
+	if (remaining <= 0) return false;
+	return attempt(remaining);
 }
 
 type DaemonlessRefresh =
