@@ -451,9 +451,18 @@ export type SessionStartReason = "startup" | "reload" | "new" | "resume" | "fork
  * shape the explicit tool refuses — and CodeGraph itself follows the link, so an automatic sync,
  * warm-up, or init must never write into it: an empty linked directory reports "absent", and
  * init -y would create the other checkout's database through the link. */
+/** The `.codegraph` shape stat safeIndexDirectory verdicts on; injectable for the same
+ * runner-portability reason as the lease module's index database stat seam. */
+let indexDirLstat: typeof lstatSync = lstatSync;
+
+/** Sets a test replacement for the `.codegraph` shape stat; undefined restores the real one. */
+export function setIndexDirLstatForTests(impl: typeof lstatSync | undefined): void {
+	indexDirLstat = impl ?? lstatSync;
+}
+
 function safeIndexDirectory(cwd: string): boolean {
 	try {
-		const index = lstatSync(join(cwd, ".codegraph"));
+		const index = indexDirLstat(join(cwd, ".codegraph"));
 		return !index.isSymbolicLink() && index.isDirectory();
 	} catch (error) {
 		// Only a confirmed absence is safe; any other stat failure — permissions, an unreadable
@@ -1152,6 +1161,15 @@ const STAGING_COPY_SKIP = new Set(["node_modules", ".git"]);
  * session nor eat staging space, and the validating sync still reconciles the same files with
  * the publication target untouched. The seed's staging cleanup unlinks links and copies alike
  * without ever following them. */
+/** The recursive staging copy the share fallback runs; injectable so tests can hold it
+ * mid-flight and observe its event-loop responsiveness on every runner. */
+let stagingCopy: typeof cp = cp;
+
+/** Sets a test replacement for the staging copy; undefined restores the real one. */
+export function setStagingCopyForTests(impl: typeof cp | undefined): void {
+	stagingCopy = impl ?? cp;
+}
+
 async function materializeStagingSources(worktree: string, stagingRoot: string): Promise<void> {
 	for (const entry of await readdir(worktree, { withFileTypes: true })) {
 		if (entry.name === ".codegraph") continue;
@@ -1161,7 +1179,7 @@ async function materializeStagingSources(worktree: string, stagingRoot: string):
 			try {
 				await symlink(target, staged, process.platform === "win32" ? "junction" : undefined);
 			} catch {
-				await cp(target, staged, { recursive: true, filter: (source) => !STAGING_COPY_SKIP.has(basename(source)) });
+				await stagingCopy(target, staged, { recursive: true, filter: (source) => !STAGING_COPY_SKIP.has(basename(source)) });
 			}
 		} else if (entry.isFile()) {
 			try {

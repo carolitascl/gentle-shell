@@ -12,7 +12,7 @@ import test from "node:test";
 import { isWorkspaceProjectRoot } from "../extensions/codegraph-tools.ts";
 import { daemonFor, setPipeProbeForTests } from "../lib/codegraph-daemon.ts";
 import { clearCodegraphResolveCache } from "../lib/codegraph-cli-resolve.ts";
-import { leaseHostIdentity, lockPathFor, readLeaseVerdict } from "../lib/codegraph-lease.ts";
+import { leaseHostIdentity, lockPathFor, readLeaseVerdict, setIndexDbStatForTests } from "../lib/codegraph-lease.ts";
 import { seedWorktreeIndex } from "../lib/codegraph-seed.ts";
 import {
 	buildWindowsCommand,
@@ -26,6 +26,8 @@ import {
 	runCodegraph,
 	runCodegraphSeedSync,
 	sessionSkipsReadiness,
+	setIndexDirLstatForTests,
+	setStagingCopyForTests,
 	setTreeKillSeamForTests,
 	skipsSession,
 	spawnCodegraph,
@@ -637,20 +639,13 @@ test("prepareReadiness: an unknown index state or a non-project runs nothing", a
 	// A real non-ENOENT stat error for the database: only that makes indexState say "unknown",
 	// where an empty directory would just read "absent" and exercise the non-project branch.
 	const runs: string[] = [];
-	const dbPath = join(unknown, ".codegraph", "codegraph.db");
-	const realStatSync = fsSync.statSync;
-	t.mock.method(fsSync, "statSync", ((...args: Parameters<typeof fsSync.statSync>) => {
-		if (String(args[0]) === dbPath) {
-			const denied = new Error("simulated unreadable index") as NodeJS.ErrnoException;
-			denied.code = "EACCES";
-			throw denied;
-		}
-		return realStatSync(...args);
-	}) as typeof fsSync.statSync);
-	syncBuiltinESMExports();
+	setIndexDbStatForTests(() => {
+		const denied = new Error("simulated unreadable index") as NodeJS.ErrnoException;
+		denied.code = "EACCES";
+		throw denied;
+	});
 	t.after(() => {
-		t.mock.restoreAll();
-		syncBuiltinESMExports();
+		setIndexDbStatForTests(undefined);
 	});
 	const unknownResult = await prepareReadiness(fakeInput(unknown, {
 		isProjectRoot: () => true,
@@ -2071,15 +2066,13 @@ test("runCodegraphSeedSync: the share copy fallback leaves the event loop and sk
 		releaseCopy = resolve;
 	});
 	const realCp = fsSync.promises.cp as (...args: unknown[]) => Promise<void>;
-	t.mock.method(fsSync.promises, "cp", (async (...args: unknown[]) => {
+	setStagingCopyForTests((async (...args: unknown[]) => {
 		copyStarted = true;
 		await gate;
 		return realCp(...args);
 	}) as typeof fsSync.promises.cp);
-	syncBuiltinESMExports();
 	t.after(() => {
-		t.mock.restoreAll();
-		syncBuiltinESMExports();
+		setStagingCopyForTests(undefined);
 	});
 	const inFlight = runCodegraphSeedSync(["sync", "-q"], staging, 10_000);
 	// cp runs only after the initial `await readdir` resolved: waiting for it observes the
@@ -2625,20 +2618,13 @@ test("prepareReadiness: a .codegraph whose stat fails closed is never refreshed"
 	const cwd = dir(t, "sync-stat-error");
 	writeDb(cwd);
 	const runs: string[] = [];
-	const indexPath = join(cwd, ".codegraph");
-	const realLstatSync = fsSync.lstatSync;
-	t.mock.method(fsSync, "lstatSync", ((...args: Parameters<typeof fsSync.lstatSync>) => {
-		if (String(args[0]) === indexPath) {
-			const denied = new Error("simulated unreadable index directory") as NodeJS.ErrnoException;
-			denied.code = "EACCES";
-			throw denied;
-		}
-		return realLstatSync(...args);
-	}) as typeof fsSync.lstatSync);
-	syncBuiltinESMExports();
+	setIndexDirLstatForTests(() => {
+		const denied = new Error("simulated unreadable index directory") as NodeJS.ErrnoException;
+		denied.code = "EACCES";
+		throw denied;
+	});
 	t.after(() => {
-		t.mock.restoreAll();
-		syncBuiltinESMExports();
+		setIndexDirLstatForTests(undefined);
 	});
 	const result = await prepareReadiness(fakeInput(cwd, {
 		run: async (args) => {
@@ -3009,9 +2995,7 @@ test("prepareReadiness: a child whose worktree index appears mid-gate never sync
 	let gateSawAbsent = false;
 	let statsAfterGate = 0;
 	const realStatSync = fsSync.statSync;
-	const dbPath = join(worktree, ".codegraph", "codegraph.db");
-	t.mock.method(fsSync, "statSync", ((...args: Parameters<typeof fsSync.statSync>) => {
-		if (String(args[0]) !== dbPath) return realStatSync(...args);
+	setIndexDbStatForTests(((...args: Parameters<typeof fsSync.statSync>) => {
 		if (!gateSawAbsent) {
 			gateSawAbsent = true;
 			const absent = new Error("simulated pre-publication index") as NodeJS.ErrnoException;
@@ -3021,10 +3005,8 @@ test("prepareReadiness: a child whose worktree index appears mid-gate never sync
 		statsAfterGate += 1;
 		return realStatSync(...args);
 	}) as typeof fsSync.statSync);
-	syncBuiltinESMExports();
 	t.after(() => {
-		t.mock.restoreAll();
-		syncBuiltinESMExports();
+		setIndexDbStatForTests(undefined);
 	});
 	const calls: string[] = [];
 	const result = await prepareReadiness(fakeInput(worktree, {
