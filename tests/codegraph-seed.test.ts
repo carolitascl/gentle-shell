@@ -80,6 +80,17 @@ function fileAbsent(path: string): boolean {
 	}
 }
 
+/** Absence of the directory entry itself, not of what it resolves to: only ENOENT counts,
+ * so a link left dangling by staging cleanup fails here instead of passing as absence. */
+function entryAbsent(path: string): boolean {
+	try {
+		lstatSync(path);
+		return false;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT";
+	}
+}
+
 /** A SeedInput whose CLI run records calls; copies are the real filesystem. */
 function seedHarness(cwd: string, overrides: Partial<SeedInput> = {}): { input: SeedInput; calls: string[] } {
 	const calls: string[] = [];
@@ -615,7 +626,7 @@ test("a refused link never publishes a final database", async (t) => {
 	assert.equal(linkedDestination, target, "the seed links the staged snapshot to the final database path");
 	assert.equal(result.outcome, "seed-failed");
 	assert.equal(attempts, 1);
-	assert.equal(fileAbsent(target), true, "the refused link leaves the final name absent");
+	assert.equal(entryAbsent(target), true, "the refused link leaves the final directory entry absent: no database and no dangling link");
 	assert.deepEqual(readdirSync(join(worktree, ".codegraph")), [".gitignore"]);
 });
 
