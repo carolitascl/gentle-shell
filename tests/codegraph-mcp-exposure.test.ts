@@ -699,3 +699,35 @@ test("ensureDirectExposure: two unknown file identities are a conflict, never a 
 	assert.equal(readFileSync(config, "utf8"), WITH_CODEGRAPH, "the config is left exactly as it was");
 	assert.deepEqual(readdirSync(dir), ["mcp.json"], "the retries leave no temp file or lock behind");
 });
+
+test("ensureDirectExposure: an unknown observation recovers when the retry observes one proven identity", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-recover-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const config = join(dir, "mcp.json");
+	writeFileSync(config, WITH_CODEGRAPH, "utf8");
+	// The first attempt's verified read observes no identity — a stat that failed transiently — so
+	// that attempt stops short of the publish. The bounded restart must not report that unknown as
+	// a conflict: the next attempt observes the same defined identity at its verified read and at
+	// its publish, and the entry lands on exactly one write.
+	const proven = fileIdentity(config);
+	assert.notEqual(proven, undefined, "the fixture file itself has an identity the retry can prove");
+	let observations = 0;
+	let writes = 0;
+	const io: EnsureExposureIo = {
+		read: (path) => (existsSync(path) ? readFileSync(path, "utf8") : undefined),
+		identityOf: () => {
+			observations += 1;
+			return observations === 1 ? undefined : proven;
+		},
+		write: (path, text) => {
+			writes += 1;
+			atomicWriteFile(path, text);
+		},
+	};
+	assert.equal(ensureDirectExposure(config, io).outcome, "added", "the retry that proves one identity publishes the entry");
+	assert.equal(writes, 1, "exactly one write lands");
+	assert.equal(observations, 4, "the unknown observation and the retry that proves it both ran: one observation pair per attempt, none after the publish");
+	const published = JSON.parse(readFileSync(config, "utf8")) as { mcpServers: { codegraph: { exposure?: string } } };
+	assert.equal(published.mcpServers.codegraph.exposure, "direct", "the published entry carries the direct exposure");
+	assert.deepEqual(readdirSync(dir), ["mcp.json"], "the publish leaves no temp file or lock behind");
+});

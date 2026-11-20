@@ -1804,16 +1804,36 @@ test("an adoption whose restore loses to a competing publication recovers the di
 	const doneB = join(sandbox, "b-done");
 	// The acknowledgment that releases A: a retry sleep is the only blocking wait this child can
 	// reach once the per-path mutex is held, so a wait it reports after the test cleared the file
-	// is proof that the adoption's restore link met the publication at the path.
+	// is proof that the adoption's restore link met the publication at the path. That same
+	// sleep hosts a second barrier: the retry it leads into stays parked until A has reversed,
+	// and the recovery clock is held still while it waits so the park spends no retry budget.
 	const ackB = `${markerB}.checked`;
+	const armB = `${markerB}.armed`;
+	const releaseB = `${markerB}.released`;
 	const scriptB = join(sandbox, "b.mjs");
 	writeFileSync(scriptB, [
 		'import { existsSync, writeFileSync } from "node:fs";',
 		"const [libHref, tokenPath, ready, go, marker, done] = process.argv.slice(2);",
 		'const ack = marker + ".checked";',
+		'const arm = marker + ".armed";',
+		'const release = marker + ".released";',
 		"const realWait = Atomics.wait;",
+		"const realNow = Date.now;",
+		"const spin = new Int32Array(new SharedArrayBuffer(4));",
+		"let firstWait = true;",
+		"let stalled = 0;",
+		"Date.now = () => realNow() - stalled;",
 		"Atomics.wait = (...args) => {",
-		"\twriteFileSync(ack, \"eexist\");",
+		"\tif (!existsSync(arm) || !firstWait) return realWait(...args);",
+		"\tfirstWait = false;",
+		'\twriteFileSync(ack, "eexist");',
+		"\tconst parkedAt = realNow();",
+		"\tconst watchdog = parkedAt + 10_000;",
+		"\twhile (!existsSync(release)) {",
+		"\t\tif (realNow() >= watchdog) process.exit(4);",
+		"\t\trealWait(spin, 0, 0, 5);",
+		"\t}",
+		"\tstalled += realNow() - parkedAt;",
 		"\treturn realWait(...args);",
 		"};",
 		"const { tryAcquireLease } = await import(libHref);",
@@ -1872,9 +1892,12 @@ test("an adoption whose restore loses to a competing publication recovers the di
 	// The handshake that pins the order the thread names: A stays parked at its scan — its token
 	// provably still at the path — while B's publish link and its first restore both lose to it,
 	// and B acknowledges that first EEXIST from inside its retry loop. Only that acknowledgment
-	// releases A, and the retry that follows A's reversal is B's own next attempt, so neither
-	// child's scheduling is part of the ordering.
+	// releases A, and B's retry then waits at a second barrier until A reports its reversal, so
+	// neither child's scheduling is part of the ordering: a parent descheduled past the restore's
+	// budget cannot strand the displaced record, because the retry only spends that budget while
+	// the publication it must outlast still occupies the path.
 	rmSync(ackB, { force: true }); // while B stays parked at its nonce read, no wait can follow this clear
+	writeFileSync(armB, ""); // arms the retry barrier before B resumes
 	writeSync(parkedAdopted, bTokenBytes);
 	closeSync(parkedAdopted);
 	await waitForFileContents(ackB, "eexist", "the adoption never met the publication at the path");
@@ -1882,6 +1905,12 @@ test("an adoption whose restore loses to a competing publication recovers the di
 	releaseParkedFifo(parkedScan);
 	rmSync(lockFifo, { force: true });
 	await waitForFileContents(markerA, "lost", "the competing publication never reported its reversal");
+	// A's token has left the path while B still sits in its first retry sleep, so the record the
+	// restore must re-occupy has an empty path to land on: releasing the barrier here is what
+	// keeps A's scheduling out of B's recovery budget, and the path assertion below proves the
+	// barrier held B until the reversal was complete.
+	assert.ok(!existsSync(path), "the competitor's token left the path before the adoption's retry was released");
+	writeFileSync(releaseB, "");
 	await waitForFileContents(markerB, "adopted", "the adoption never finished its recovery window");
 	assert.ok(existsSync(path), "the displaced lease is back at the path after the competitor reversed its publication");
 	const recovered = JSON.parse(readFileSync(path, "utf8")) as { pid: number; nonce?: string; writerPid?: number };
