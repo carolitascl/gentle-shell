@@ -38,7 +38,7 @@ export type ExposureOutcome =
 	| "no-server"
 	/** The update itself failed (an unreadable or unwritable file); that path is left as it was. */
 	| "error"
-	/** The file changed under the update on every bounded retry; nothing was written. */
+	/** The file changed under the update on every bounded retry, or the locked destination was replaced mid-update; nothing was written. */
 	| "conflict"
 	/** Another writer holds the config lock; the update did not run and nothing was written. */
 	| "busy";
@@ -118,15 +118,27 @@ const fsIo: AtomicFileIo = {
 };
 
 /**
- * Replaces one file's whole content atomically: the text is written to a temporary regular file
- * in the destination's own directory — the same filesystem, so the final rename cannot copy —
- * and renamed over the destination. A replacement that fails part-way therefore leaves the
- * original file untouched, sibling entries included when it is an mcp.json. A symlinked
- * destination keeps receiving updates through the file it points at, the destination's
- * permission bits are preserved exactly, and the renamed-in file is always a regular file.
+ * Replaces one file's whole content atomically: the destination is resolved the way a direct
+ * write resolves it, then the text is written to a temporary regular file in the destination's
+ * own directory — the same filesystem, so the final rename cannot copy — and renamed over the
+ * destination. A replacement that fails part-way therefore leaves the original file untouched,
+ * sibling entries included when it is an mcp.json. A symlinked destination keeps receiving
+ * updates through the file it points at, the destination's permission bits are preserved
+ * exactly, and the renamed-in file is always a regular file.
  */
 export function atomicWriteFile(path: string, text: string, io: AtomicFileIo = fsIo): void {
-	const target = io.resolve(path);
+	writeResolvedFile(io.resolve(path), text, io);
+}
+
+/**
+ * {@link atomicWriteFile}'s replacement steps for an already-resolved destination: the rename
+ * lands on the destination itself without resolving it again, so a symlink substituted for the
+ * final component after resolution cannot redirect the write to another file. The temporary
+ * file lives in the destination's own directory — the same filesystem, so the final rename
+ * cannot copy — the destination's permission bits are preserved exactly, and the renamed-in
+ * file is always a regular file.
+ */
+function writeResolvedFile(target: string, text: string, io: AtomicFileIo): void {
 	const mode = io.modeOf(target) ?? NEW_CONFIG_MODE;
 	const temp = join(dirname(target), `.${basename(target)}.tmp-${randomUUID()}`);
 	try {
@@ -139,6 +151,11 @@ export function atomicWriteFile(path: string, text: string, io: AtomicFileIo = f
 			/* the successful rename already consumed the temporary file */
 		}
 	}
+}
+
+/** Whether the error is a plain absent-path failure, as opposed to permissions or other I/O. */
+function isEnoent(error: unknown): boolean {
+	return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "ENOENT";
 }
 
 /** How old the lock file may be before a holder that crashed without releasing is considered gone. */
@@ -320,7 +337,10 @@ function ownsConfigLock(configPath: string): boolean {
 const defaultIo: EnsureExposureIo = {
 	resolve: (path) => fsIo.resolve(path),
 	read: (path) => (existsSync(path) ? readFileSync(path, "utf8") : undefined),
-	write: (path, text) => atomicWriteFile(path, text),
+	// io.write always receives the destination ensureDirectExposure already resolved — the same
+	// path the lock and every read address — so the write must not resolve it again: a symlink
+	// substituted for the final component after resolution would redirect the publish.
+	write: (path, text) => writeResolvedFile(path, text, fsIo),
 	acquireLock: (path) => acquireConfigLock(path),
 	releaseLock: (path) => releaseConfigLock(path),
 	ownsLock: (path) => ownsConfigLock(path),
@@ -347,14 +367,28 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * can no longer prove it owns at the publish: a holder displaced by a takeover publishes nothing.
  * The whole update addresses the destination a write itself resolves to — a symlinked config
  * and every other link to the same shared file contend on one lock and one file identity,
- * while the reported path stays the caller's own.
+ * while the reported path stays the caller's own. A config whose parent directory does not
+ * exist yet is reported as `"missing"` without creating anything — resolution distinguishes
+ * only that absent-parent case, and every other resolution failure propagates. The publish
+ * re-checks the destination it locked and refuses with `"conflict"` when the file there has
+ * been replaced, so the update never writes through a link it did not lock.
  */
 export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaultIo): EnsureExposureResult {
 	// The lock, the reads, and the publish all address the destination a write itself resolves
 	// to: two mcp.json symlinks to one shared file must contend on one lock, or their updates
 	// race through exactly the window the lock exists to serialize. The caller's own path is
 	// what the result reports.
-	const target = io.resolve?.(path) ?? path;
+	let target: string;
+	try {
+		target = io.resolve?.(path) ?? path;
+	} catch (error) {
+		// A fresh home has no agent directory yet: the destination's parent is missing, so
+		// resolution fails before anything can be read. That is a missing config — nothing is
+		// created, no directory and no lock — while every other failure (permissions, other
+		// I/O) propagates unchanged to the caller.
+		if (isEnoent(error)) return { path, outcome: "missing" };
+		throw error;
+	}
 	// The lock, when the io provides one, spans the complete read-modify-write — every read,
 	// the verification, and the replacement — so two coordinated writers serialize instead of
 	// racing through the verify-to-rename window; a lock the update cannot take means another
@@ -383,6 +417,11 @@ export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaul
 			// A lock taken over mid-update means another writer owns the config now: publish
 			// nothing rather than write under a lock that is no longer this update's own.
 			if (io.acquireLock !== undefined && io.ownsLock !== undefined && !io.ownsLock(target)) return { path, outcome: "busy" };
+			// The publish lands only on the destination the update locked: if the file there was
+			// replaced after the lock — by a symlink to another config or any other substitution
+			// — re-resolving it no longer names the locked destination, and writing would land
+			// outside this update's lock. A changed destination is a conflict.
+			if (io.resolve !== undefined && io.resolve(target) !== target) return { path, outcome: "conflict" };
 			io.write(target, `${JSON.stringify(doc, null, 2)}\n`);
 			return { path, outcome: "added" };
 		}
@@ -396,7 +435,8 @@ export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaul
  * isolated home, each resolved from the session's own overrides exactly as the runtime loads it
  * (see {@link codegraphMcpPaths}). An I/O failure on one home is isolated: that path is reported
  * as `"error"` and every remaining home is still attempted, so one unwritable config never
- * blocks the other homes.
+ * blocks the other homes. A home that was never provisioned — no agent directory at all — is
+ * reported as `"missing"`, not an error.
  */
 export function ensureDirectExposureInAgentHomes(home: string = homedir(), io: EnsureExposureIo = defaultIo, env: NodeJS.ProcessEnv = process.env): EnsureExposureResult[] {
 	return [...new Set(codegraphMcpPaths(home, env))].map((path) => {

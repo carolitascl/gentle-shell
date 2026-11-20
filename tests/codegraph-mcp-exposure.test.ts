@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import {
 	acquireConfigLock,
@@ -525,9 +525,109 @@ test("releaseConfigLock: a release that resumes after a takeover restores the su
 	releaseConfigLock(config);
 	assert.equal(readFileSync(lock, "utf8"), "4321:successor\n", "the successor's lock survives the delayed release");
 	assert.deepEqual(readdirSync(dir).sort(), [".mcp.json.lock", "mcp.json"], "no release claim file is left behind");
-	// A vanished lock path releases silently and stays gone.
+	assert.deepEqual(readdirSync(dir).sort(), [".mcp.json.lock", "mcp.json"], "no release claim file is left behind");
+});
+
+test("releaseConfigLock: a vanished lock file while the token is still held releases without resurrecting anything", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-vanish-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const config = join(dir, "mcp.json");
+	writeFileSync(config, WITH_CODEGRAPH, "utf8");
+	const lock = lockPathFor(config);
+	assert.equal(acquireConfigLock(config), true);
+	// The lock file vanishes while this process still owns its acquisition token: the release
+	// takes the missing path aside, its rename fails, and the release returns without
+	// resurrecting any lock or claim file.
 	rmSync(lock);
 	releaseConfigLock(config);
 	assert.equal(existsSync(lock), false, "a vanished lock is not resurrected by its release");
-	assert.deepEqual(readdirSync(dir), ["mcp.json"], "nothing else appears beside the config");
+	assert.deepEqual(readdirSync(dir), ["mcp.json"], "no lock or release claim file is left behind");
+	assert.equal(acquireConfigLock(config), true, "the vanished lock's path is free for the next acquisition");
+	releaseConfigLock(config);
+	assert.equal(existsSync(lock), false, "the fresh release removes its own lock");
+});
+
+test("ensureDirectExposure: an absent agent-directory parent is a missing config, not an error", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-fresh-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const fresh = join(dir, "no-such-home", "mcp.json");
+	assert.deepEqual(ensureDirectExposure(fresh), { path: fresh, outcome: "missing" });
+	assert.equal(existsSync(dirname(fresh)), false, "the absent parent directory is not created");
+	assert.deepEqual(readdirSync(dir), [], "no config, lock, or temporary file appears anywhere");
+});
+
+test("ensureDirectExposureInAgentHomes: a fresh home without agent directories reports missing, not error", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-homes-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const env = { GENTLE_PI_AGENT_HOME: join(dir, "pi"), GENTLE_SHELL_HOME: join(dir, "shell") };
+	const results = ensureDirectExposureInAgentHomes("/h", undefined, env);
+	assert.deepEqual(
+		results.map((result) => result.outcome),
+		["missing", "missing"],
+		"both homes of a never-provisioned home are missing configs",
+	);
+	assert.deepEqual(readdirSync(dir), [], "the update creates no directory, lock, or file");
+});
+
+test("ensureDirectExposure: a resolution failure other than an absent parent is still an error", () => {
+	const denied: NodeJS.ErrnoException = new Error("EACCES: permission denied, realpath '/p/.pi'");
+	denied.code = "EACCES";
+	const io: EnsureExposureIo = {
+		resolve: () => {
+			throw denied;
+		},
+		read: () => undefined,
+		write: () => {},
+	};
+	assert.throws(() => ensureDirectExposure("/p/mcp.json", io), /EACCES/, "a denied parent propagates to the direct caller");
+	const results = ensureDirectExposureInAgentHomes("/h", io, { GENTLE_PI_AGENT_HOME: "/p", GENTLE_SHELL_HOME: "/s" });
+	assert.deepEqual(
+		results.map((result) => result.outcome),
+		["error", "error"],
+		"the multi-home helper isolates the failure as error",
+	);
+});
+
+test("ensureDirectExposure: a locked destination replaced by a symlink is a conflict, never a write through the new link", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-swap-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const locked = join(dir, "real-mcp.json");
+	writeFileSync(locked, WITH_CODEGRAPH, "utf8");
+	const other = join(dir, "other-mcp.json");
+	// Identical content on purpose: the verify re-read compares text, so only the destination
+	// identity check can catch a swap to an equally-worded config.
+	writeFileSync(other, WITH_CODEGRAPH, "utf8");
+	try {
+		symlinkSync(other, join(dir, "redirect-mcp.json"));
+	} catch {
+		t.skip("symlinks are unavailable on this platform");
+		return;
+	}
+	let reads = 0;
+	const io: EnsureExposureIo = {
+		resolve: (path) => {
+			try {
+				return realpathSync(path);
+			} catch {
+				return join(realpathSync(dirname(path)), basename(path));
+			}
+		},
+		read: (path) => {
+			reads += 1;
+			if (path === locked && reads === 2) {
+				// The locked file is replaced between the update's two reads: same words, other file.
+				unlinkSync(locked);
+				symlinkSync(other, locked);
+			}
+			return existsSync(path) ? readFileSync(path, "utf8") : undefined;
+		},
+		// The publication shape the io carried before the fix: it re-resolves its destination, so
+		// a substituted symlink redirects the write. With the fix the update must refuse to
+		// publish before this writer ever runs.
+		write: (path, text) => atomicWriteFile(path, text),
+	};
+	assert.equal(ensureDirectExposure(locked, io).outcome, "conflict", "the changed destination is a conflict, not an update");
+	assert.equal(readFileSync(other, "utf8"), WITH_CODEGRAPH, "the other config is never written");
+	assert.ok(lstatSync(locked).isSymbolicLink(), "the substituted symlink is left exactly as it was");
+	assert.ok(!readdirSync(dir).some((name) => name.includes(".tmp-")), "no temporary file is left behind");
 });
