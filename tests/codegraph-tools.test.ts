@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import net from "node:net";
@@ -30,6 +30,7 @@ import codeGraphTools, {
 	indexStartNotice,
 	indexedNotice,
 	SYNC_FRESH_WINDOW_MS,
+	DAEMON_SKIP_MS,
 	type CodeGraphRunner,
 	type DaemonExplore,
 } from "../extensions/codegraph-tools.ts";
@@ -93,8 +94,16 @@ function nativeSocketPath(home: string): string {
 
 /** A fake daemon socket server answering initialize and tools/call like the real daemon.
  * `initializeDelayMs` holds the initialize reply back so a test can interleave work (a newer
- * session starting) while a warm-up against the socket is still pending. */
-function fakeDaemonServer(initializeDelayMs = 0): net.Server {
+ * session starting) while a warm-up against the socket is still pending. The optional
+ * handshake holds the initialize reply until the test releases it: onInitialize fires when
+ * that request arrives, onCall when the client sends its first post-initialize request. */
+interface DaemonServerHandshake {
+	onInitialize?: () => void;
+	releaseInitialize?: Promise<void>;
+	onCall?: () => void;
+}
+
+function fakeDaemonServer(initializeDelayMs = 0, handshake: DaemonServerHandshake = {}): net.Server {
 	return net.createServer((socket) => {
 		socket.on("error", () => {});
 		socket.write(JSON.stringify({ codegraph: "1.6.0", protocol: 1 }) + "\n");
@@ -112,11 +121,14 @@ function fakeDaemonServer(initializeDelayMs = 0): net.Server {
 				};
 				if (message.method === "initialize") {
 					const greeting = { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "fake", version: "0" } };
-					if (initializeDelayMs === 0) reply(greeting);
+					handshake.onInitialize?.();
+					if (handshake.releaseInitialize) void handshake.releaseInitialize.then(() => reply(greeting));
+					else if (initializeDelayMs === 0) reply(greeting);
 					else setTimeout(() => reply(greeting), initializeDelayMs);
 					continue;
 				}
 				if (message.method === "tools/call") {
+					handshake.onCall?.();
 					reply({ content: [{ type: "text", text: "daemon answer" }], isError: false });
 				}
 			}
@@ -670,6 +682,29 @@ test("a cached linked-worktree validation dies with the gitdir its .git file nam
 	renameSync(main, join(base, "main-moved"));
 
 	assert.equal(isWorkspaceProjectRoot(linked), false, "the stale cached root is rejected once the .git file's gitdir target is gone");
+});
+
+test("a cached validation dies with a non-regular .git marker instead of reading it", (t) => {
+	if (process.platform === "win32") {
+		t.skip("the FIFO fixture is POSIX-only");
+		return;
+	}
+	const cwd = workspace(t);
+	assert.equal(isWorkspaceProjectRoot(cwd), true, "the workspace validates and caches first");
+
+	// A FIFO replaces the directory marker while a writer holds the pipe ready with a
+	// well-formed gitdir line naming an existing directory: a check that reads the marker
+	// would consume that line and keep the cache alive — and with no writer at all the same
+	// synchronous read would block the whole session.
+	rmSync(join(cwd, ".git"), { recursive: true, force: true });
+	const marker = join(cwd, ".git");
+	execFileSync("mkfifo", [marker]);
+	const gitdir = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-gitdir-")));
+	t.after(() => rmSync(gitdir, { recursive: true, force: true }));
+	const writer = spawn("sh", ["-c", 'echo "gitdir: $1" > "$2"', "sh", gitdir, marker]);
+	t.after(() => writer.kill());
+
+	assert.equal(isWorkspaceProjectRoot(cwd), false, "a non-regular marker is not a repository marker, whatever it would say");
 });
 
 test("CodeGraph init reports the missing binary distinctly", async (t) => {
@@ -1499,6 +1534,93 @@ test("the guard keeps the caller's directory when a conditional list skips its c
 	// The unconditional form is unchanged.
 	const unconditional = verdictFrom(fresh, "cd " + destination + " && codegraph init") as { block?: boolean } | undefined;
 	assert.equal(unconditional?.block, true, "the successful cd && form still judges the destination");
+});
+
+test("the guard forms a conditional operator only from adjacent separators", async (t) => {
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+	codeGraphTools({
+		registerTool() { /* the registered tool's shape is covered above */ },
+		on(event, handler) { handlers.set(event, handler); },
+	} as unknown as ExtensionAPI);
+	const guard = handlers.get("tool_call");
+	const { indexed, fresh } = await spacedWorkspaces(t);
+	const previousOverride = process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	t.after(() => {
+		if (previousOverride === undefined) delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+		else process.env.GENTLE_CODEGRAPH_ALLOW_INDEX = previousOverride;
+	});
+	const verdictFrom = (cwd: string, command: string) =>
+		(guard as (event: unknown, ctx: unknown) => unknown)({ toolName: "bash", input: { command } }, { cwd } as ExtensionContext);
+	const shellQuoted = (path: string) => "'" + path + "'";
+
+	// Two background separators with a command between them are two separate `&`: the second
+	// one introduces the cd, which runs unconditionally, and the init lands in the fresh
+	// checkout behind the genuinely adjacent `&&` at the end of the list.
+	assert.equal(
+		verdictFrom(indexed, "true & false & cd " + shellQuoted(fresh) + " && codegraph init"),
+		undefined,
+		"the second & of `& cmd &` never combines with the first into &&",
+	);
+	// Control: a genuinely adjacent && still gates the branch — the cd runs behind the
+	// certainly-failed false and the init is judged at the indexed destination.
+	const gated = verdictFrom(fresh, "false || cd " + shellQuoted(indexed) + " && codegraph init") as { block?: boolean } | undefined;
+	assert.equal(gated?.block, true, "an adjacent && after a running cd still forms the conditional");
+});
+
+test("a rebuild the walker proves unreachable never reaches the guard", async (t) => {
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+	codeGraphTools({
+		registerTool() { /* the registered tool's shape is covered above */ },
+		on(event, handler) { handlers.set(event, handler); },
+	} as unknown as ExtensionAPI);
+	const guard = handlers.get("tool_call");
+	const { indexed } = await spacedWorkspaces(t);
+	const previousOverride = process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	t.after(() => {
+		if (previousOverride === undefined) delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+		else process.env.GENTLE_CODEGRAPH_ALLOW_INDEX = previousOverride;
+	});
+	const verdictFrom = (cwd: string, command: string) =>
+		(guard as (event: unknown, ctx: unknown) => unknown)({ toolName: "bash", input: { command } }, { cwd } as ExtensionContext);
+
+	// A rebuild its branch provably skips never runs, so it is not the caller's rebuild.
+	assert.equal(verdictFrom(indexed, "false && codegraph init"), undefined, "an init behind a certainly-failed command cannot run");
+	// A branch this walk cannot evaluate stays checked: the rebuild may still run.
+	const unknownBranch = verdictFrom(indexed, "grep -q x file && codegraph init") as { block?: boolean } | undefined;
+	assert.equal(unknownBranch?.block, true, "an unknowable branch never proves the rebuild unindexed");
+});
+
+test("the walker carries the last executed status past a branch the shell skips", async (t) => {
+	const handlers = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+	codeGraphTools({
+		registerTool() { /* the registered tool's shape is covered above */ },
+		on(event, handler) { handlers.set(event, handler); },
+	} as unknown as ExtensionAPI);
+	const guard = handlers.get("tool_call");
+	const { indexed, fresh } = await spacedWorkspaces(t);
+	const previousOverride = process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+	t.after(() => {
+		if (previousOverride === undefined) delete process.env.GENTLE_CODEGRAPH_ALLOW_INDEX;
+		else process.env.GENTLE_CODEGRAPH_ALLOW_INDEX = previousOverride;
+	});
+	const verdictFrom = (cwd: string, command: string) =>
+		(guard as (event: unknown, ctx: unknown) => unknown)({ toolName: "bash", input: { command } }, { cwd } as ExtensionContext);
+	const shellQuoted = (path: string) => "'" + path + "'";
+
+	// The skipped false keeps the success of the true before it: the cd and the init both
+	// run, and the first init in the fresh checkout must not be judged at the indexed caller.
+	assert.equal(
+		verdictFrom(indexed, "true || false && cd " + shellQuoted(fresh) + " && codegraph init"),
+		undefined,
+		"a skipped command's status never gates the branch after it",
+	);
+	// The same walk with the indexed destination: the cd runs there and the init is blocked.
+	const atIndexed = verdictFrom(fresh, "true || false && cd " + shellQuoted(indexed) + " && codegraph init") as { block?: boolean; reason?: string } | undefined;
+	assert.equal(atIndexed?.block, true, "the cd the skipped branch leaves running still moves the rebuild");
+	assert.match(atIndexed?.reason ?? "", /an index already exists/);
 });
 
 test("the guard's inline override honors the last GENTLE_CODEGRAPH_ALLOW_INDEX assignment", async (t) => {
@@ -2362,6 +2484,43 @@ test("an older search's daemon failure never demotes an unexpired startup bypass
 	assert.equal(attempts, 2, "the next search runs no daemon attempt after the older search published its failure");
 });
 
+test("an expired startup bypass makes way for a fresh prompt-scoped one in the same prompt", async (t) => {
+	withPlatform(t, "linux");
+	const cwd = workspace(t);
+	const restore = armStartupDaemonSkipForTest(cwd);
+	t.after(restore);
+	// The startup verdict's own clock runs out mid-prompt: the frozen now advances past the
+	// deadline without the prompt boundary that would otherwise clear the entry.
+	let now = Date.now();
+	const realNow = Date.now;
+	Date.now = () => now;
+	t.after(() => {
+		Date.now = realNow;
+	});
+	let attempts = 0;
+	const tool = createCodeGraphTool(async () => ({ stdout: "cli answer", stderr: "" }), {
+		daemonExplore: async () => {
+			attempts += 1;
+			return { status: "unavailable" as const };
+		},
+		rewarm: noRewarm,
+		warm: async () => true,
+		syncRun: syncNothing,
+	});
+
+	now += DAEMON_SKIP_MS + 1;
+	const first = await tool.execute("test", { operation: "query", query: "first" }, undefined, undefined, { cwd } as ExtensionContext);
+	assert.match(first.content[0].text, /cli answer/);
+	assert.equal(attempts, 2, "the expired entry lets the search run the full chain again");
+
+	// The chain's failure must re-arm the bypass for the rest of the prompt: a later search
+	// answers through the CLI without paying attempt, warm-up, and attempt again.
+	const second = await tool.execute("test", { operation: "query", query: "second" }, undefined, undefined, { cwd } as ExtensionContext);
+	assert.match(second.content[0].text, /cli answer/);
+	assert.equal((second.details as { viaDaemon?: boolean }).viaDaemon, false);
+	assert.equal(attempts, 2, "an expired startup entry no longer blocks the prompt-scoped bypass");
+});
+
 test("when the daemon and the CLI both fail, the search reports the standard failure", async (t) => {
 	const cwd = workspace(t);
 	const daemonDown: DaemonExplore = async () => ({ status: "unavailable" });
@@ -2695,15 +2854,32 @@ test("a retry warm-up's ready notice never rides a session that started after it
 		ui: { notify: (text: string, level: string) => noticesA.push({ text, level }) },
 	} as unknown as ExtensionContext);
 
-	// A live, answering daemon whose initialize reply is delayed so session B's start lands
-	// while the retry warm-up is still pending.
+	// A live, answering daemon whose initialize reply is held until the test releases it:
+	// session B starts while the warm-up is provably pending, and the release then lets the
+	// warm-up succeed.
 	const cwd = workspace(t);
 	const home = realpathSync(mkdtempSync(join(tmpdir(), "gentle-pi-codegraph-warmhome-b-")));
 	t.after(() => rmSync(home, { recursive: true, force: true }));
 	const registryDir = join(home, ".codegraph", "daemons");
 	mkdirSync(registryDir, { recursive: true });
 	const socketPath = nativeSocketPath(home);
-	const server = fakeDaemonServer(200);
+	let initializeSeen: (() => void) | undefined;
+	const initializeArrived = new Promise<void>((resolve) => {
+		initializeSeen = resolve;
+	});
+	let callSeen: (() => void) | undefined;
+	const callArrived = new Promise<void>((resolve) => {
+		callSeen = resolve;
+	});
+	let releaseInitialize: (() => void) | undefined;
+	const initializeHeld = new Promise<void>((resolve) => {
+		releaseInitialize = resolve;
+	});
+	const server = fakeDaemonServer(0, {
+		onInitialize: () => initializeSeen?.(),
+		releaseInitialize: initializeHeld,
+		onCall: () => callSeen?.(),
+	});
 	await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
 	t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
 	writeFileSync(join(registryDir, "record.json"), JSON.stringify({ root: cwd, socketPath, startedAt: 1, pid: process.pid }));
@@ -2729,16 +2905,20 @@ test("a retry warm-up's ready notice never rides a session that started after it
 	});
 
 	const search = tool.execute("test", { operation: "query", query: "symbol" }, undefined, undefined, { cwd } as ExtensionContext);
-	// B's start is scheduled to land while the retry warm-up is pending: the first daemon
-	// attempt settles at once, the warm then holds on the delayed initialize reply, so the
-	// warm is initiated while A is still the current session and B starts inside its window.
-	setTimeout(() => {
-		sessionStart({ reason: "startup" }, {
-			cwd: nonProject("b"),
-			hasUI: true,
-			ui: { notify: (text: string, level: string) => noticesB.push({ text, level }) },
-		} as unknown as ExtensionContext);
-	}, 50);
+	// B's start lands while the retry warm-up is provably pending: the first daemon attempt
+	// settles at once, the warm then holds on the initialize reply, and B starts only after
+	// the daemon saw the warm-up's initialize request — a timer could fire before the warm-up
+	// reached the daemon and leave the assertions below vacuous.
+	await initializeArrived;
+	sessionStart({ reason: "startup" }, {
+		cwd: nonProject("b"),
+		hasUI: true,
+		ui: { notify: (text: string, level: string) => noticesB.push({ text, level }) },
+	} as unknown as ExtensionContext);
+	// The held reply goes out only after B replaced A; the warm-up then completes its
+	// handshake, and its post-initialize request is the proof it succeeded.
+	releaseInitialize?.();
+	await callArrived;
 
 	let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -2753,6 +2933,9 @@ test("a retry warm-up's ready notice never rides a session that started after it
 		clearTimeout(deadlineTimer);
 	}
 
+	// The negative assertions are about a warm-up that provably succeeded — the fixture saw
+	// its post-initialize request after session B had replaced A — so the discarded ready
+	// notice was real, not a warm-up that never reached the daemon behind a quiet fallback.
 	assert.ok(!noticesB.some((notice) => /CodeGraph ready/.test(notice.text)), "a newer session never receives another session's ready notice");
 	assert.ok(!noticesA.some((notice) => /CodeGraph ready/.test(notice.text)), "a superseded session's completion notice is discarded, not re-routed");
 	assert.ok(!noticesB.some((notice) => /warm-up failed|not answering/.test(notice.text)), "no failure notice leaks either");

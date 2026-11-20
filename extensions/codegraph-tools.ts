@@ -231,8 +231,12 @@ function gitRootMarkerPresent(resolved: string): boolean {
 		const markerPath = join(resolved, ".git");
 		if (lstatSync(markerPath).isDirectory()) return true;
 		// A symlinked `.git` resolving to a directory is metadata as well; only a regular file
-		// carries the gitdir pointer the cache must follow.
-		if (statSync(markerPath).isDirectory()) return true;
+		// carries the gitdir pointer the cache must follow — and anything else is rejected
+		// before the read: a FIFO, socket, or device is not a marker Git wrote, and reading
+		// one synchronously could block the whole session on a pipe with no writer.
+		const marker = statSync(markerPath);
+		if (marker.isDirectory()) return true;
+		if (!marker.isFile()) return false;
 		const target = gitdirTarget(resolved);
 		return target !== undefined && statSync(target).isDirectory();
 	} catch {
@@ -718,10 +722,14 @@ function shellCommandList(command: string): ShellListCommand[] {
 		}
 		if (char === "\n" || char === ";" || char === "&" || char === "|") {
 			commands.push({ text: current, operator });
+			// A doubled & or | is one operator (`&&`, `||`), never two separators — but only
+			// when the two characters are adjacent in the input: a command between them means
+			// the previous separator introduced that command and this one stands alone
+			// (`true & false & cd x` runs the cd behind the second &, not behind &&).
+			const doubled = current === "" && operator === char;
 			current = "";
 			wordStart = true;
-			// A doubled & or | is one operator (`&&`, `||`), never two separators.
-			operator = operator === char && (char === "&" || char === "|") ? operator + char : char;
+			operator = doubled && (char === "&" || char === "|") ? operator + char : char;
 			continue;
 		}
 		current += char;
@@ -814,14 +822,22 @@ function codegraphIndexCommands(command: string, startCwd: string): RebuildComma
 			previousVerdict = runs === false ? previousVerdict : runs === true ? true : undefined;
 			continue;
 		}
-		// A command that can move the directory in a form this walk cannot follow makes
-		// every later command's directory unknowable.
-		if (UNTRACKABLE_CWD_COMMAND.test(parsed.rest)) cwd = undefined;
-		const verb = rebuild.exec(parsed.rest);
-		if (verb !== null) {
-			rebuilds.push({ rest: parsed.rest, verb: verb[1] as "index" | "init", allowIndexOverride: parsed.allowIndexOverride, cwd });
+		// A branch the shell provably skips runs nothing: it moves no directory, rebuilds no
+		// index, and leaves the last executed status in place for the commands after it —
+		// `true || false && cd elsewhere` skips the false and keeps the success, so the cd
+		// runs. A branch this walk cannot evaluate may have run, so its command stays checked
+		// and the verdict stays unknowable.
+		const runs = branchRuns(part.operator, previousVerdict);
+		if (runs !== false) {
+			// A command that can move the directory in a form this walk cannot follow makes
+			// every later command's directory unknowable.
+			if (UNTRACKABLE_CWD_COMMAND.test(parsed.rest)) cwd = undefined;
+			const verb = rebuild.exec(parsed.rest);
+			if (verb !== null) {
+				rebuilds.push({ rest: parsed.rest, verb: verb[1] as "index" | "init", allowIndexOverride: parsed.allowIndexOverride, cwd });
+			}
+			previousVerdict = runs === true ? staticExitStatus(parsed.rest) : undefined;
 		}
-		previousVerdict = staticExitStatus(parsed.rest);
 	}
 	return rebuilds;
 }
@@ -1152,7 +1168,7 @@ async function queryViaDaemon(cwd: string, parameters: CodeGraphToolParameters, 
 const daemonSkipUntil = new Map<string, number>();
 
 /** How long a wedged daemon is bypassed after its post-warm attempt times out. */
-const DAEMON_SKIP_MS = 60_000;
+export const DAEMON_SKIP_MS = 60_000;
 
 /** The bypass entries a session START recorded from its own health verdict: unlike the
  * prompt-scoped failures the query path records, these survive the first
@@ -1568,8 +1584,10 @@ export function createCodeGraphTool(
 						// attempt+warm+attempt on every query. A search that started before session start can
 						// publish its failure after the startup wedge was recorded; the startup verdict then
 						// keeps its own deadline and marker instead of being demoted to a prompt-scoped
-						// failure the next prompt boundary would clear.
-						if (!startupDaemonSkip.has(cwd)) {
+						// failure the next prompt boundary would clear — but only while that deadline still
+						// runs: an expired startup entry must not block the fresh bypass this failure earns,
+						// or every later search of the prompt re-runs the attempt chain the bypass skips.
+						if (!(startupDaemonSkip.has(cwd) && (daemonSkipUntil.get(cwd) ?? 0) > Date.now())) {
 							daemonSkipUntil.set(cwd, Date.now() + DAEMON_SKIP_MS);
 							// Fresh query evidence supersedes a startup verdict: this entry is prompt-scoped.
 							startupDaemonSkip.delete(cwd);
