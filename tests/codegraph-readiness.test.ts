@@ -1090,12 +1090,30 @@ test("runCodegraphSeedSync: the share copy fallback leaves the event loop and sk
 	const worktree = dirname(dirname(staging));
 	mkdirSync(join(worktree, "node_modules", "left-pad"), { recursive: true });
 	writeFileSync(join(worktree, "node_modules", "left-pad", "index.js"), "module.exports = 1;\n");
+	// Enough source files that the copy spans many event-loop turns: with a single source file
+	// the transfer can finish inside one turn, and the in-progress sample below would never land.
+	const bulkFiles = 400;
+	for (let index = 0; index < bulkFiles; index += 1) {
+		writeFileSync(join(worktree, "src", `bulk-${index}.ts`), `export const value${index} = ${index};\n`);
+	}
 	// Pre-existing staging entries force the same link failure a Windows share causes for every
 	// top-level entry, so both trees take the copy fallback.
 	mkdirSync(join(staging, "src"));
 	mkdirSync(join(staging, "node_modules"));
+	// The observation starts only after the source enumeration resolved: the recursive copy
+	// enters once the awaited readdir returned, so a partially staged tree is the copy itself
+	// running. A blocking copy would spend the whole transfer inside one turn and leave the
+	// staging tree either empty or complete at every point the loop could look at it.
 	const inFlight = runCodegraphSeedSync(["sync", "-q"], staging, 10_000);
-	assert.equal(existsSync(join(staging, "src", "a.ts")), false, "a blocking copy would have finished inside the call itself: the copy runs off the event loop");
+	let copiedDuringObservation = 0;
+	const observeDeadline = Date.now() + 5_000;
+	while (Date.now() < observeDeadline) {
+		copiedDuringObservation = readdirSync(join(staging, "src")).length;
+		if (copiedDuringObservation > 0 && copiedDuringObservation <= bulkFiles) break;
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	assert.ok(copiedDuringObservation > 0, "the copy was observed running: the event loop advanced after the source enumeration");
+	assert.ok(copiedDuringObservation <= bulkFiles, "the sample landed between the first and the last copied file: the copy never blocked the event loop");
 	const report = await inFlight;
 	assert.deepEqual(report, { ok: true, removedEntries: false }, "the bounded copy still validates the staged index");
 	assert.equal(seen(), "seen", "the validating sync saw the worktree's sources through the copy");
@@ -1484,6 +1502,20 @@ test("prepareReadiness: a linked worktree is seeded instead of initialized", asy
 	}));
 	assert.deepEqual(result, { action: "init", ok: true, warm: "ok" });
 	assert.deepEqual(calls, ["warm"], "no init ran: the seed produced the index");
+});
+
+test("prepareReadiness: reports unsupported hard-link publication", async (t) => {
+	const cwd = dir(t, "seed-hardlink-unsupported");
+	writeFileSync(join(cwd, "package.json"), "{}\n");
+	const error = "CodeGraph seed publication requires hard links; use a worktree filesystem that supports hard links.";
+	const calls: string[] = [];
+	const result = await prepareReadiness(fakeInput(cwd, {
+		seed: async () => ({ outcome: "seed-failed", error }),
+		run: async () => { calls.push("run"); return true; },
+		warm: async () => { calls.push("warm"); return true; },
+	}));
+	assert.deepEqual(result, { action: "init", ok: false, warm: "skipped", error });
+	assert.deepEqual(calls, []);
 });
 
 test("prepareReadiness: seed outcomes target-exists, deferred, seed-failed, and not-seedable", async (t) => {

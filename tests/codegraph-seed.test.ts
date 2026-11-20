@@ -110,7 +110,7 @@ test("seedWorktreeIndex: not-seedable for a main checkout or a worktree without 
 	assert.equal(noSource.outcome, "not-seedable", "no main database means nothing to copy");
 });
 
-test("seedWorktreeIndex: staged copy, gitignore, rename, then one sync; the target becomes an index", async (t) => {
+test("seedWorktreeIndex: staged snapshot, gitignore, hard link, then one sync; the target becomes an index", async (t) => {
 	const { worktree } = worktreePair(t);
 	const { input, calls } = seedHarness(worktree);
 
@@ -149,7 +149,7 @@ test("seedWorktreeIndex: a failed sync removes the seeded database so absent sta
 
 test("a blocked final placement returns seed-failed and leaves no torn database", async (t) => {
 	const { worktree } = worktreePair(t);
-	// A directory squatting on the database's final name makes the publish rename fail.
+	// A directory squatting on the database's final name makes the publishing hard link fail.
 	mkdirSync(join(worktree, ".codegraph", "codegraph.db"), { recursive: true });
 	const result = await seedWorktreeIndex(seedHarness(worktree).input);
 	assert.equal(result.outcome, "seed-failed", "the caller learns the copy failed, never a rejection");
@@ -168,7 +168,7 @@ test("a staged database removed by the validating sync still fails the seed", as
 
 	const result = await seedWorktreeIndex(input);
 
-	assert.equal(result.outcome, "seed-failed", "the database rename stays required: its absence is a failure, never a skip");
+	assert.equal(result.outcome, "seed-failed", "the published database stays required: its absence is a failure, never a skip");
 	assert.equal(fileAbsent(join(worktree, ".codegraph", "codegraph.db")), true, "nothing is published");
 	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore"], "no staging remnant stays behind");
 });
@@ -505,7 +505,7 @@ test("an independent publish during validation is never replaced by the seed", a
 	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore", "codegraph.db"], "no staging leftover and nothing the seed did not place is removed");
 });
 
-test("a filesystem that refuses hard links still publishes the validated database", async (t) => {
+test("a filesystem that refuses hard links fails without publishing", async (t) => {
 	const { worktree } = worktreePair(t);
 	let linkAttempts = 0;
 	const { input, calls } = seedHarness(worktree, {
@@ -519,14 +519,52 @@ test("a filesystem that refuses hard links still publishes the validated databas
 
 	const result = await seedWorktreeIndex(input);
 
-	assert.equal(linkAttempts, 1, "the atomic link publish was attempted exactly once before the fallback");
-	assert.equal(result.outcome, "seeded", "the exclusive-create fallback publishes where the link cannot land");
+	assert.equal(linkAttempts, 1, "the atomic link publish was attempted exactly once");
+	assert.deepEqual(result, { outcome: "seed-failed", error: "CodeGraph seed publication requires hard links; use a worktree filesystem that supports hard links." });
 	assert.deepEqual(calls, ["sync -q"], "exactly one sync validates the snapshot");
-	assert.deepEqual(markerNotes(join(worktree, ".codegraph", "codegraph.db")), ["committed"], "the published database carries the snapshot's committed data");
-	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore", "codegraph.db"], "only the index and its gitignore remain: no staging leftovers");
+	assert.equal(fileAbsent(join(worktree, ".codegraph", "codegraph.db")), true, "no database is published");
+	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore"], "no staging leftovers remain");
 });
 
-test("the link-less fallback never replaces a database that appeared meanwhile", async (t) => {
+test("every confirmed unsupported-link errno yields the same actionable diagnostic", async (t) => {
+	for (const code of ["ENOTSUP", "EOPNOTSUPP", "ENOSYS"]) {
+		const { worktree } = worktreePair(t);
+		const result = await seedWorktreeIndex(seedHarness(worktree, {
+			link: () => {
+				throw Object.assign(new Error("hard links are not supported"), { code });
+			},
+		}).input);
+		assert.deepEqual(
+			result,
+			{ outcome: "seed-failed", error: "CodeGraph seed publication requires hard links; use a worktree filesystem that supports hard links." },
+			code + " positively proves the operation is unsupported, so the diagnostic names the missing support",
+		);
+		assert.equal(fileAbsent(join(worktree, ".codegraph", "codegraph.db")), true, code + " leaves the final name absent");
+	}
+});
+
+test("an EPERM during publication reports neutral remediation after retries", async (t) => {
+	const { worktree } = worktreePair(t);
+	const sleeps: number[] = [];
+	let attempts = 0;
+	const result = await seedWorktreeIndex(seedHarness(worktree, {
+		link: () => {
+			attempts += 1;
+			throw Object.assign(new Error("permission denied"), { code: "EPERM" });
+		},
+		sleep: async (ms) => { sleeps.push(ms); },
+	}).input);
+	assert.deepEqual(result, {
+		outcome: "seed-failed",
+		error: "CodeGraph seed hard-link publication failed; check filesystem hard-link support and permissions.",
+	});
+	assert.equal(attempts, 3);
+	assert.deepEqual(sleeps, [50, 100]);
+	assert.equal(fileAbsent(join(worktree, ".codegraph", "codegraph.db")), true);
+	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore"]);
+});
+
+test("a refused link never replaces a database that appeared meanwhile", async (t) => {
 	const { worktree } = worktreePair(t);
 	let linkAttempts = 0;
 	const { input } = seedHarness(worktree, {
@@ -535,9 +573,7 @@ test("the link-less fallback never replaces a database that appeared meanwhile",
 			throw Object.assign(new Error("hard links are not supported"), { code: "ENOTSUP" });
 		},
 		run: async () => {
-			// An independent writer publishes while this seed's validation is pending; the
-			// filesystem refuses the link, so only the fallback's exclusive create can
-			// protect the newer database.
+			// An independent writer publishes while this seed's validation is pending.
 			writeFileSync(join(worktree, ".codegraph", "codegraph.db"), "independent-bytes");
 			return true;
 		},
@@ -545,10 +581,101 @@ test("the link-less fallback never replaces a database that appeared meanwhile",
 
 	const result = await seedWorktreeIndex(input);
 
-	assert.equal(linkAttempts, 1, "the atomic link publish was attempted exactly once before the fallback");
-	assert.equal(result.outcome, "seed-failed", "the copy fallback refuses the occupied name instead of winning it");
-	assert.equal(readFileSync(join(worktree, ".codegraph", "codegraph.db"), "utf8"), "independent-bytes", "the independent publish survives the fallback");
+	assert.equal(linkAttempts, 1, "the atomic link publish was attempted exactly once");
+	assert.equal(result.outcome, "seed-failed", "the failed link leaves the occupied name untouched");
+	assert.equal(readFileSync(join(worktree, ".codegraph", "codegraph.db"), "utf8"), "independent-bytes", "the independent publish survives the failed link");
 	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore", "codegraph.db"], "no staging leftover and nothing the seed did not place is removed");
+});
+
+test("a link-less filesystem leaves the validated snapshot unpublished", async (t) => {
+	const { worktree } = worktreePair(t);
+	let stagedIdentity: { dev: bigint; ino: bigint; size: number } | undefined;
+	let visibleDuringValidation: boolean | undefined;
+	const { input } = seedHarness(worktree, {
+		link: () => {
+			// A continuously available SMB share refuses CreateHardLinkW: the atomic
+			// link publish is rejected by the filesystem itself, not by a competing writer.
+			throw Object.assign(new Error("hard links are not supported"), { code: "ENOTSUP" });
+		},
+		run: async () => {
+			// Validation runs while the completed snapshot still lives in staging: capture
+			// the staged file's identity there, and confirm the final name is still invisible.
+			const staging = readdirSync(join(worktree, ".codegraph")).find((entry) => entry.startsWith("seed-"));
+			assert.ok(staging, "the staged snapshot exists during validation");
+			const staged = statSync(join(worktree, ".codegraph", staging, ".codegraph", "codegraph.db"), { bigint: true });
+			stagedIdentity = { dev: staged.dev, ino: staged.ino, size: Number(staged.size) };
+			visibleDuringValidation = !fileAbsent(join(worktree, ".codegraph", "codegraph.db"));
+			return true;
+		},
+	});
+
+	const result = await seedWorktreeIndex(input);
+
+	assert.equal(result.outcome, "seed-failed");
+	assert.equal(visibleDuringValidation, false, "the final name stays invisible during validation");
+	assert.ok(stagedIdentity, "the validated snapshot existed in staging");
+	assert.equal(fileAbsent(join(worktree, ".codegraph", "codegraph.db")), true, "no snapshot is published without a no-replace operation");
+	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore"], "no staging leftovers remain");
+});
+
+test("a missing staged snapshot on a link-less filesystem leaves no final database", async (t) => {
+	const { worktree } = worktreePair(t);
+	const { input } = seedHarness(worktree, {
+		link: () => {
+			throw Object.assign(new Error("hard links are not supported"), { code: "ENOTSUP" });
+		},
+		run: async () => {
+			// Validation passes, but the staged snapshot disappears before publication.
+			const staging = readdirSync(join(worktree, ".codegraph")).find((entry) => entry.startsWith("seed-"));
+			assert.ok(staging, "the staged snapshot exists during validation");
+			rmSync(join(worktree, ".codegraph", staging), { recursive: true, force: true });
+			return true;
+		},
+	});
+
+	const result = await seedWorktreeIndex(input);
+
+	assert.equal(result.outcome, "seed-failed", "publication fails closed");
+	assert.equal(fileAbsent(join(worktree, ".codegraph", "codegraph.db")), true, "no empty database is published");
+	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore"], "no staging leftover and no final database");
+});
+
+test("a successor appearing when the link fails remains untouched", async (t) => {
+	const { worktree } = worktreePair(t);
+	const target = join(worktree, ".codegraph", "codegraph.db");
+	const result = await seedWorktreeIndex(seedHarness(worktree, {
+		link: () => {
+			writeFileSync(target, "successor");
+			throw Object.assign(new Error("unsupported"), { code: "ENOTSUP" });
+		},
+	}).input);
+	assert.equal(result.outcome, "seed-failed");
+	assert.equal(readFileSync(target, "utf8"), "successor");
+	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore", "codegraph.db"]);
+});
+
+test("publication is a no-replace hard link of the validated snapshot", async (t) => {
+	const { worktree } = worktreePair(t);
+	let staged: { dev: bigint; ino: bigint } | undefined;
+	const { input } = seedHarness(worktree, {
+		run: async () => {
+			const staging = readdirSync(join(worktree, ".codegraph")).find((entry) => entry.startsWith("seed-"));
+			assert.ok(staging, "the staged snapshot exists during validation");
+			const stagedDb = statSync(join(worktree, ".codegraph", staging, ".codegraph", "codegraph.db"), { bigint: true });
+			staged = { dev: stagedDb.dev, ino: stagedDb.ino };
+			assert.equal(fileAbsent(join(worktree, ".codegraph", "codegraph.db")), true, "the final name stays absent while validation runs");
+			return true;
+		},
+	});
+
+	const result = await seedWorktreeIndex(input);
+
+	assert.equal(result.outcome, "seeded", "a filesystem that provides hard links still publishes the validated database");
+	assert.ok(staged, "the staged file's identity was captured");
+	const published = statSync(join(worktree, ".codegraph", "codegraph.db"), { bigint: true });
+	assert.equal(published.dev, staged.dev, "the published database sits on the same filesystem as the staging project");
+	assert.equal(published.ino, staged.ino, "the published database is the validated staged file itself, published by a link and never copied");
+	assert.deepEqual(markerNotes(join(worktree, ".codegraph", "codegraph.db")), ["committed"], "the published database carries the snapshot's committed data");
 });
 
 test("a seed whose init-lock nonce is unreadable at publication stands down", async (t) => {
@@ -605,7 +732,7 @@ test("a seed displaced while a transient publication retry waits never publishes
 	const { input } = seedHarness(worktree, {
 		locksDir,
 		run: async () => {
-			// The first rename fails transiently: a read-only index directory makes the
+			// The first placement fails transiently: a read-only index directory makes the
 			// placement fail with EACCES, one of the transient retry codes.
 			chmodSync(join(worktree, ".codegraph"), 0o555);
 			return true;
@@ -626,7 +753,7 @@ test("a seed displaced while a transient publication retry waits never publishes
 
 	const result = await seedWorktreeIndex(input);
 
-	assert.equal(result.outcome, "seed-failed", "a seed displaced mid-retry aborts instead of renaming over the replacement holder's index");
+	assert.equal(result.outcome, "seed-failed", "a seed displaced mid-retry aborts instead of linking over the replacement holder's index");
 	assert.equal(readFileSync(join(worktree, ".codegraph", "codegraph.db"), "utf8"), "newer-index-bytes", "the newer database the other session published survives");
 	assert.deepEqual(readdirSync(join(worktree, ".codegraph")).sort(), [".gitignore", "codegraph.db"], "no staging leftover and no stale seed file is left behind");
 });
