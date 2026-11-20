@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import {
 	codegraphMcpPaths,
 	ensureDirectExposure,
 	ensureDirectExposureInAgentHomes,
+	fileIdentity,
 	lockPathFor,
 	releaseConfigLock,
 	takeOverStaleConfigLock,
@@ -589,7 +590,7 @@ test("ensureDirectExposure: a resolution failure other than an absent parent is 
 });
 
 test("ensureDirectExposure: a locked destination replaced by a symlink is a conflict, never a write through the new link", (t) => {
-	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-swap-"));
+	const dir = realpathSync(mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-swap-")));
 	t.after(() => rmSync(dir, { recursive: true, force: true }));
 	const locked = join(dir, "real-mcp.json");
 	writeFileSync(locked, WITH_CODEGRAPH, "utf8");
@@ -630,4 +631,47 @@ test("ensureDirectExposure: a locked destination replaced by a symlink is a conf
 	assert.equal(readFileSync(other, "utf8"), WITH_CODEGRAPH, "the other config is never written");
 	assert.ok(lstatSync(locked).isSymbolicLink(), "the substituted symlink is left exactly as it was");
 	assert.ok(!readdirSync(dir).some((name) => name.includes(".tmp-")), "no temporary file is left behind");
+});
+
+test("ensureDirectExposure: an atomic replacement after the verified read is a conflict, never a lost update", (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "codegraph-mcp-exposure-atomic-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const config = join(dir, "mcp.json");
+	writeFileSync(config, WITH_CODEGRAPH, "utf8");
+	// An editor's save with different words: the swap lands after the verify re-read compared
+	// text, so only the file identity captured at that read can catch the replacement — the
+	// new file still resolves to the very destination the update locked.
+	const editorSaved = JSON.stringify(
+		{ mcpServers: { codegraph: { command: "codegraph", args: ["serve", "--mcp"], env: { EDITED: "yes" } }, context7: { command: "npx" } } },
+		null,
+		2,
+	);
+	let resolves = 0;
+	let wrote = false;
+	const io: EnsureExposureIo = {
+		resolve: (path) => {
+			resolves += 1;
+			if (resolves === 2) {
+				// The editor's atomic save between the verified read and the publish: a fresh file
+				// is renamed over the config at the same path.
+				const staged = join(dir, ".mcp.json.editor-save");
+				writeFileSync(staged, editorSaved, "utf8");
+				renameSync(staged, config);
+			}
+			try {
+				return realpathSync(path);
+			} catch {
+				return join(realpathSync(dirname(path)), basename(path));
+			}
+		},
+		read: (path) => (existsSync(path) ? readFileSync(path, "utf8") : undefined),
+		identityOf: (path) => fileIdentity(path),
+		write: (path, text) => {
+			wrote = true;
+			atomicWriteFile(path, text);
+		},
+	};
+	assert.equal(ensureDirectExposure(config, io).outcome, "conflict", "the same-path replacement is a conflict, not an update");
+	assert.equal(wrote, false, "nothing was written over the editor's save");
+	assert.equal(readFileSync(config, "utf8"), editorSaved, "the editor's changes survive byte-for-byte");
 });

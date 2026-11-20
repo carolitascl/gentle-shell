@@ -67,6 +67,13 @@ export interface EnsureExposureIo {
 	 * publishes nothing. Absent means the io cannot verify ownership and the publish is
 	 * unguarded by it. */
 	ownsLock?(path: string): boolean;
+	/** A stable identity of the file currently at `path` — device, inode, mtime, size — or
+	 * undefined when it cannot be observed. The publish compares it with the identity the
+	 * verified read captured, so an atomic replacement at the same path (an editor's
+	 * temp-and-rename save) is refused even though the path still resolves to the same
+	 * destination and no symlink moved. Absent means this io cannot observe identities and the
+	 * publish is guarded by path identity alone. */
+	identityOf?(path: string): string | undefined;
 }
 
 /** Mode used when the update creates a config file because none existed yet. */
@@ -334,9 +341,24 @@ function ownsConfigLock(configPath: string): boolean {
 	return readLockContent(lockPath) === token;
 }
 
+/** The file's identity as the publish guard needs it: device, inode, nanosecond mtime, and
+ * size pin the exact file a verified read observed. An atomic save always renames a fresh
+ * inode over the path, so a changed identity at the publish is a replacement even when the
+ * path and its resolution look unchanged. Exported so a custom io guards with the same
+ * identity the default io derives. */
+export function fileIdentity(path: string): string | undefined {
+	try {
+		const stat = statSync(path, { bigint: true });
+		return `${stat.dev}:${stat.ino}:${stat.mtimeNs}:${stat.size}`;
+	} catch {
+		return undefined;
+	}
+}
+
 const defaultIo: EnsureExposureIo = {
 	resolve: (path) => fsIo.resolve(path),
 	read: (path) => (existsSync(path) ? readFileSync(path, "utf8") : undefined),
+	identityOf: (path) => fileIdentity(path),
 	// io.write always receives the destination ensureDirectExposure already resolved — the same
 	// path the lock and every read address — so the write must not resolve it again: a symlink
 	// substituted for the final component after resolution would redirect the publish.
@@ -371,7 +393,9 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * exist yet is reported as `"missing"` without creating anything — resolution distinguishes
  * only that absent-parent case, and every other resolution failure propagates. The publish
  * re-checks the destination it locked and refuses with `"conflict"` when the file there has
- * been replaced, so the update never writes through a link it did not lock.
+ * been replaced, so the update never writes through a link it did not lock — and refuses the
+ * same way when the file there is no longer the exact file the verified read observed (an
+ * editor's atomic same-path save), so a later write can never discard it.
  */
 export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaultIo): EnsureExposureResult {
 	// The lock, the reads, and the publish all address the destination a write itself resolves
@@ -409,6 +433,10 @@ export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaul
 			const entry = isPlainObject(servers) ? servers.codegraph : undefined;
 			if (!isPlainObject(entry)) return { path, outcome: "no-server" };
 			if ("exposure" in entry) return { path, outcome: "present" };
+			// The file identity captured with the verified read: the publish compares it again, so
+			// an atomic replacement at the same path between the two — same destination, fresh
+			// inode — cannot slip past on an unchanged path identity alone.
+			const verifiedIdentity = io.identityOf?.(target);
 			if (io.read(target) !== raw) {
 				if (attempt >= MAX_UPDATE_ATTEMPTS) return { path, outcome: "conflict" };
 				continue; // a concurrent writer changed the file: restart from its current content
@@ -422,6 +450,10 @@ export function ensureDirectExposure(path: string, io: EnsureExposureIo = defaul
 			// — re-resolving it no longer names the locked destination, and writing would land
 			// outside this update's lock. A changed destination is a conflict.
 			if (io.resolve !== undefined && io.resolve(target) !== target) return { path, outcome: "conflict" };
+			// And the file there must still be the exact file the verified read observed: an
+			// editor's atomic save after that read keeps the destination identical but always
+			// replaces the inode, and writing on top of it would discard the editor's changes.
+			if (io.identityOf !== undefined && io.identityOf(target) !== verifiedIdentity) return { path, outcome: "conflict" };
 			io.write(target, `${JSON.stringify(doc, null, 2)}\n`);
 			return { path, outcome: "added" };
 		}

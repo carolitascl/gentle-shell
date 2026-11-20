@@ -303,20 +303,41 @@ function dropFile(file: string): void {
 	}
 }
 
+/** How long a restore that met a publication at the path retries its no-replace link inside
+ * the section: the publisher's own post-publication scan (createLease) reverses a lease that
+ * landed beside a live displaced record within a handful of syscalls, so a brief bounded retry
+ * recovers the displaced lease right after that reversal instead of leaving an empty path
+ * beside the record — the wedge where release() finds no token and later acquisitions
+ * fail-closed on the sidecar until it expires. An occupant that survives the budget is a
+ * legitimate owner; the record stays recoverable beside it exactly as before. */
+const RESTORE_RECOVERY_MS = 250;
+
 /** Puts a displaced record back at its path. Every caller holds the per-path mutex, so a
  * conforming session can never occupy the empty path here — a restore that loses to EEXIST met
  * a publisher whose own section had already lost the mutex (its validations died with it), and
  * any other failure (I/O, permission, a dangling reference) proves nothing about who owns the
  * path either way: the record stays beside it as a recoverable file in both cases — the
  * abandoned-record cleanup and the TTL bound how long it can sit there — instead of being
- * deleted out from under a holder that may still be starting its writer. */
-function restoreDisplacedRecord(graveyard: string, path: string): void {
-	try {
-		linkSync(graveyard, path);
-	} catch {
-		return; // unexplained, or a publication landed in the window: either way, keep the record recoverable
+ * deleted out from under a holder that may still be starting its writer. A caller that hands a
+ * recovery budget retries the no-replace link while EEXIST persists: the publication occupying
+ * the path reverses itself within a handful of syscalls when it landed beside this very record
+ * (its own scan demands it), and the retry that succeeds then re-occupies the path with the
+ * displaced lease without ever replacing a surviving owner. */
+function restoreDisplacedRecord(graveyard: string, path: string, recoveryMs: number = 0): void {
+	const deadline = Date.now() + recoveryMs;
+	for (;;) {
+		try {
+			linkSync(graveyard, path);
+		} catch (error) {
+			// Only EEXIST — a publication occupying the path — can resolve itself; every other
+			// failure proves nothing about ownership and never improves by retrying.
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST" || Date.now() >= deadline) return;
+			sleepSync(MUTEX_POLL_MS);
+			continue;
+		}
+		dropFile(graveyard); // restored: the extra name goes
+		return;
 	}
-	dropFile(graveyard); // restored: the extra name goes
 }
 
 /** Token records a displaced section left beside the path (`<name>.<uuid>.stale`): a section
@@ -401,8 +422,12 @@ function adoptWriterPid(path: string, pid: number, proxy: boolean, now: number =
 				} catch {
 					// The publish failed: restore the displaced original before anything else — a
 					// best-effort metadata update must never delete the lease it updated. A restore
-					// that cannot be explained by a retaken path keeps the record recoverable beside it.
-					restoreDisplacedRecord(graveyard, path);
+					// that cannot be explained by a retaken path keeps the record recoverable beside it,
+					// and the bounded recovery retries the restore while the publication that took the
+					// path may still reverse itself (see restoreDisplacedRecord) — so the shape where
+					// both links lose to one publication ends with the lease back at the path, never
+					// with an empty path beside a live record.
+					restoreDisplacedRecord(graveyard, path, RESTORE_RECOVERY_MS);
 					return undefined;
 				}
 				dropFile(graveyard); // this acquisition's superseded record: litter once the adoption is in place
