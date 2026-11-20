@@ -1343,9 +1343,9 @@ test("runCodegraph: a delayed Windows tree kill holds the timeout result until t
 	try {
 		const ok = await runCodegraph(["sync", "-q"], dir(t, "winkill-cwd"), 200);
 		const settledAt = Date.now();
-		// The escalation path starts two tree kills (the timeout's and the grace escalation's);
-		// both completions are observed before the assertion so a premature settlement compares
-		// against the latest completion, never a pending one.
+		// The timeout's kill is the run's first attempt; a confirmation ends the attempts, so the
+		// completions are observed before the assertion — a premature settlement would otherwise
+		// compare against a still-pending one.
 		const completionDeadline = Date.now() + 5_000;
 		while (completions.length < kills.length && Date.now() < completionDeadline) {
 			await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1430,6 +1430,92 @@ test("runCodegraph: a Windows tree kill that reported an error holds the result 
 	assert.equal(infos[infos.length - 1]?.teardownUnconfirmed, true, "the run reports the unproved teardown so no caller starts a retry beside a possible writer");
 });
 
+test("runCodegraph: an unconfirmed teardown closes this process's pipes to the abandoned writer", { timeout: 60_000 }, async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX fake-bin harness; the Windows settlement path itself runs through the kill seam");
+	const bin = dir(t, "winkill-detach-bin");
+	const pidFile = join(bin, "child.pid");
+	const marker = join(bin, "pipe-closed.marker");
+	// The command publishes its pid and writes to its stdout forever, ignoring SIGPIPE so a closed
+	// pipe surfaces as a failed write: the marker it drops then is the observable proof that this
+	// process closed the run's local pipes, and a run that leaves them open never produces one.
+	writeFileSync(join(bin, "codegraph"), "#!/bin/sh\ntrap '' PIPE\nprintf '%s\\n' \"$$\" > \"$FAKE_PIDFILE\"\nwhile :; do\n  if ! printf 'x\\n'; then printf 'closed\\n' > \"$FAKE_MARKER\"; exit 0; fi\n  sleep 0.05\ndone\n");
+	chmodSync(join(bin, "codegraph"), 0o755);
+	const previousPath = process.env.PATH;
+	process.env.PATH = `${bin}:${previousPath}`;
+	process.env.FAKE_PIDFILE = pidFile;
+	process.env.FAKE_MARKER = marker;
+	let treePid: number | undefined;
+	const rememberedPid = (): number | undefined => {
+		if (treePid !== undefined) return treePid;
+		if (!existsSync(pidFile)) return undefined;
+		const pid = Number(readFileSync(pidFile, "utf8").trim());
+		return Number.isInteger(pid) && pid > 0 ? (treePid = pid) : undefined;
+	};
+	t.after(() => {
+		process.env.PATH = previousPath;
+		delete process.env.FAKE_PIDFILE;
+		delete process.env.FAKE_MARKER;
+		// Remembered on its own: a failed assertion must still be able to end the writer, even
+		// after the directory cleanup has taken its pid file.
+		const pid = rememberedPid();
+		if (pid !== undefined) killFakeTreePid(pid);
+	});
+	setTreeKillSeamForTests({
+		platform: () => "win32",
+		// A taskkill whose result never arrives: nothing proves the tree gone, so the run settles
+		// unconfirmed beside a writer that is still running.
+		windowsKill: () => {},
+	});
+	t.after(() => setTreeKillSeamForTests(undefined));
+	const infos: { ok: boolean; teardownUnconfirmed?: boolean }[] = [];
+	let runningAtSettlement: boolean | undefined;
+	const ok = await runCodegraph(["sync", "-q"], dir(t, "winkill-detach-cwd"), 200, undefined, (info) => {
+		infos.push(info);
+		const pid = rememberedPid();
+		runningAtSettlement = pid === undefined ? undefined : processRunning(pid);
+	});
+	assert.equal(ok, false, "the timed-out command still reports the failure");
+	assert.equal(infos[infos.length - 1]?.teardownUnconfirmed, true, "dropping the local handles is never taken for proof that the writer terminated");
+	assert.equal(runningAtSettlement, true, "the writer was still running when the settlement landed, so its pipes are the only thing this process could still hold");
+	const deadline = Date.now() + 5_000;
+	while (!existsSync(marker) && Date.now() < deadline) {
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	assert.ok(existsSync(marker), "the settlement closed the run's read ends: the abandoned writer's next write found them gone instead of those pipes holding the launcher open");
+});
+
+test("runCodegraph: a Windows tree kill confirmed once stays confirmed when a later attempt fails", async (t) => {
+	if (process.platform === "win32") return t.skip("POSIX fake-bin harness; the Windows settlement path itself runs through the kill seam");
+	const bin = dir(t, "winkill-first-confirmed-bin");
+	// The command exits by itself just after the deadline, so the close-time sweep wants the tree
+	// gone beside the timeout's kill. The first attempt confirms it; a later one would fail only
+	// because that attempt already removed the tree — which must never downgrade the teardown.
+	writeFileSync(join(bin, "codegraph"), "#!/bin/sh\nsleep 0.35\nexit 1\n");
+	chmodSync(join(bin, "codegraph"), 0o755);
+	const previousPath = process.env.PATH;
+	process.env.PATH = `${bin}:${previousPath}`;
+	t.after(() => {
+		process.env.PATH = previousPath;
+	});
+	const kills: number[] = [];
+	setTreeKillSeamForTests({
+		platform: () => "win32",
+		windowsKill: (_pid, onKilled) => {
+			kills.push(Date.now());
+			// First attempt: taskkill /F did terminate the tree. Any later one: the pid is already
+			// gone, so taskkill comes back with an error.
+			const first = kills.length === 1;
+			setTimeout(() => onKilled(first), 20);
+		},
+	});
+	t.after(() => setTreeKillSeamForTests(undefined));
+	const infos: { ok: boolean; teardownUnconfirmed?: boolean }[] = [];
+	const ok = await runCodegraph(["sync", "-q"], dir(t, "winkill-first-confirmed-cwd"), 200, undefined, (info) => infos.push(info));
+	assert.equal(ok, false, "the timed-out command still reports the failure");
+	assert.equal(kills.length, 1, "the timeout's kill, the escalation and the close-time sweep share one attempt per run");
+	assert.equal(infos[infos.length - 1]?.teardownUnconfirmed, undefined, "a confirmation already reported is final, so the settlement neither waits out the cap nor reports an unproved teardown");
+});
+
 test("prepareReadiness: an init whose teardown could not be confirmed is not retried", async (t) => {
 	const cwd = dir(t, "init-unconfirmed");
 	writeFileSync(join(cwd, "package.json"), "{}\n");
@@ -1449,8 +1535,31 @@ test("prepareReadiness: an init whose teardown could not be confirmed is not ret
 	}));
 	assert.deepEqual(result, { action: "init", ok: false, warm: "skipped" });
 	assert.equal(attempts, 1, "an unconfirmed teardown ends the sequence: no second init -y starts beside a possible writer");
-	assert.deepEqual(indexed, [{ action: "init", ok: false, initAttempts: 1 }], "the notice reports the single attempt that ran");
+	assert.deepEqual(indexed, [{ action: "init", ok: false, initAttempts: 1, initStop: "teardown-unconfirmed" }], "the report names the stop reason, so the notice never offers the manual init while a writer of that attempt may still run");
 	assert.equal(readLeaseVerdict(lockPathFor(cwd, "init", locks)), "free", "the lease is released even though the sequence stopped early");
+});
+
+test("prepareReadiness: a normal failure followed by an unconfirmed teardown reports why the retries stopped", async (t) => {
+	const cwd = dir(t, "init-unconfirmed-second");
+	writeFileSync(join(cwd, "package.json"), "{}\n");
+	const locks = dir(t, "init-unconfirmed-second-locks");
+	let attempts = 0;
+	const indexed: unknown[] = [];
+	const result = await prepareReadiness(fakeInput(cwd, {
+		locksDir: locks,
+		run: async (_args, _cwd, _timeoutMs, _onSpawn, onInfo) => {
+			attempts += 1;
+			// The first attempt tore its tree down and proved it; the second could not, so the
+			// sequence stops with TWO attempts — which is not an exhausted retry sequence.
+			onInfo?.({ ok: false, teardownUnconfirmed: attempts > 1 });
+			return false;
+		},
+		onIndexed: (report) => indexed.push(report),
+	}));
+	assert.deepEqual(result, { action: "init", ok: false, warm: "skipped" });
+	assert.equal(attempts, 2, "the reader stops at the first unconfirmed teardown, one attempt after the plain failure");
+	assert.deepEqual(indexed, [{ action: "init", ok: false, initAttempts: 2, initStop: "teardown-unconfirmed" }], "the attempt count alone cannot tell an exhausted sequence from one stopped on an unproved teardown");
+	assert.equal(readLeaseVerdict(lockPathFor(cwd, "init", locks)), "free", "the lease is released when the sequence stops early");
 });
 
 test("prepareReadiness: a confirmed teardown keeps the silent init retries", async (t) => {
@@ -1523,12 +1632,17 @@ test("killWindowsTree: a helper that never exits reports an unconfirmed kill wit
 			}
 		}
 	});
-	await new Promise((resolve) => setTimeout(resolve, 400));
+	// No wall-clock upper bound: a descheduled runner can dispatch the bound callback late, and the
+	// sample taken inside it — not the delay — is what proves the outcome never waited for the
+	// helper to exit. A separate watchdog keeps a stalled fixture from hanging the suite.
+	const watchdog = Date.now() + 20_000;
+	while (outcomes.length === 0 && Date.now() < watchdog) {
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
 	assert.deepEqual(outcomes, [false], "a helper that never exits reports an unconfirmed kill, exactly once");
 	assert.ok(settledAfter >= 150, "the outcome waits for the bound instead of taking a stall for a completed kill");
-	assert.ok(settledAfter < 400, "the bound is the whole lifetime of the helper: the outcome never waits for it to exit");
 	assert.equal(helpers.length, 1, "one helper per kill");
-	assert.equal(runningAtSettle, true, "the helper was still running when the outcome was reported");
+	assert.equal(runningAtSettle, true, "the helper was still running when the bound callback ran: the outcome never waits for it to exit");
 });
 
 test("buildWindowsCommand: a UNC project path keeps its backslashes and cmd metacharacters stay inert", () => {
